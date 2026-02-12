@@ -13,24 +13,57 @@ const DEFAULT_SETTINGS: ProjectSettings = {
   videoModel: 'veo-3.1-fast-generate-preview',
   ttsModel: 'gemini-2.5-flash-preview-tts',
   aspectRatio: '16:9',
-  imageStyle: 'Cinematic, highly detailed, dramatic lighting, 4k'
+};
+
+const DEFAULT_PROJECT_PROMPTS = {
+    storyboardImagePrefix: '电影级分镜，高质量，细节丰富',
+    videoGenerationPrefix: '高质量视频，电影感，流畅的动作',
+    characterExtraction: '请分析文本，提取主要角色。关注外貌、性格和典型服饰。',
+    sceneExtraction: '请分析文本，提取主要场景。关注环境描写、氛围和光影。',
 };
 
 const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
   extractionModel: 'gemini-3-flash-preview',
   projectTypePrompts: {
-    'NOVEL_VISUALIZATION': '你是一位专业的分镜师和剧本分析师。专门针对视觉改编分析小说文本。',
-    'SHORT_VIDEO': '你是一位短视频内容创作者。分析剧本时请关注节奏、互动性和传播潜力。',
-    'COMIC': '你是一位漫画编剧。请关注视觉分镜、拟声词文本和戏剧性姿势。',
-    'OTHER': '分析文本中的视觉元素。'
+    'REAL_PERSON_COMMENTARY': {
+        storyboardImagePrefix: '真人实拍风格，写实摄影，4k分辨率，细腻的皮肤质感，自然光',
+        videoGenerationPrefix: '写实风格，真人电影感，自然的微表情',
+        characterExtraction: '提取适合真人扮演的角色特征，关注现实主义的服装和外貌细节。',
+        sceneExtraction: '提取写实的场景描述，关注真实世界的物理环境和光照。'
+    },
+    'COMMENTARY_2D': {
+        storyboardImagePrefix: '2D平面动画风格，线条清晰，色彩鲜艳，夸张的表情',
+        videoGenerationPrefix: '2D动画风格，流畅的帧动画，生动',
+        characterExtraction: '提取适合2D动画的角色特征，强调轮廓和标志性配饰。',
+        sceneExtraction: '提取适合2D背景的场景描述，关注色彩搭配和构图。'
+    },
+    'COMMENTARY_3D': {
+        storyboardImagePrefix: '3D动画风格，Blender渲染，皮克斯风格，立体感，柔和的光影',
+        videoGenerationPrefix: '3D动画电影，流畅的动作捕捉，体积光',
+        characterExtraction: '提取适合3D建模的角色特征，关注体型比例和材质。',
+        sceneExtraction: '提取3D场景描述，关注空间结构和环境光遮蔽。'
+    },
+    'PREMIUM_2D': {
+        storyboardImagePrefix: '大师级2D插画，新海诚风格，绝美的光影，极高的细节',
+        videoGenerationPrefix: '高预算2D动画电影，唯美意境，粒子特效',
+        characterExtraction: '提取极具美感的角色设计，关注发丝、瞳孔等微小细节。',
+        sceneExtraction: '提取宏大的场景描述，关注天气、动态元素和艺术氛围。'
+    },
+    'PREMIUM_3D': {
+        storyboardImagePrefix: '好莱坞大片级别，虚幻引擎5渲染，光线追踪，史诗感',
+        videoGenerationPrefix: '电影级特效，史诗镜头，震撼的视觉冲击',
+        characterExtraction: '提取复杂的角色设计，关注盔甲、纹理和复杂的服装。',
+        sceneExtraction: '提取史诗级场景，关注巨大的建筑结构和复杂的气候系统。'
+    }
   }
 };
 
 const PROJECT_TYPE_LABELS: Record<ProjectType, string> = {
-    'NOVEL_VISUALIZATION': '小说可视化',
-    'SHORT_VIDEO': '短视频',
-    'COMIC': '漫画',
-    'OTHER': '其他'
+    'REAL_PERSON_COMMENTARY': '真人解说漫',
+    'COMMENTARY_2D': '2D解说漫',
+    'COMMENTARY_3D': '3D解说漫',
+    'PREMIUM_2D': '2D精品',
+    'PREMIUM_3D': '3D精品'
 };
 
 // --- Helper Components ---
@@ -352,17 +385,6 @@ const ProjectSettingsForm: React.FC<{
           </div>
         </div>
 
-        <div>
-          <label className="block text-sm font-medium text-gray-400 mb-1">全局艺术风格提示词</label>
-          <textarea 
-            value={formData.imageStyle} 
-            onChange={e => setFormData({...formData, imageStyle: e.target.value})}
-            className="w-full bg-gray-700 border border-gray-600 rounded p-2 text-white h-20 text-sm"
-            placeholder="例如：赛博朋克, 霓虹灯光, 黑暗氛围..."
-          />
-          <p className="text-xs text-gray-500 mt-1">此提示词将附加到所有图像生成请求中。</p>
-        </div>
-
         <div className="flex justify-end gap-2 mt-6">
           <button onClick={onCancel} className="px-4 py-2 rounded text-gray-300 hover:bg-gray-700">取消</button>
           <button onClick={() => onSave(formData)} className="px-4 py-2 bg-blue-600 rounded text-white hover:bg-blue-500">保存设置</button>
@@ -377,7 +399,20 @@ const GlobalSettingsModal: React.FC<{
   onClose: () => void
 }> = ({ settings, onSave, onClose }) => {
   const [localSettings, setLocalSettings] = useState(settings);
-  const [activeTab, setActiveTab] = useState<ProjectType>('NOVEL_VISUALIZATION');
+  const [activeTab, setActiveTab] = useState<ProjectType>('REAL_PERSON_COMMENTARY');
+
+  const updatePrompt = (field: keyof typeof localSettings.projectTypePrompts[ProjectType], value: string) => {
+      setLocalSettings(prev => ({
+          ...prev,
+          projectTypePrompts: {
+              ...prev.projectTypePrompts,
+              [activeTab]: {
+                  ...prev.projectTypePrompts[activeTab],
+                  [field]: value
+              }
+          }
+      }));
+  };
 
   return (
     <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
@@ -431,19 +466,42 @@ const GlobalSettingsModal: React.FC<{
                 ))}
              </div>
              
-             <textarea
-               value={localSettings.projectTypePrompts[activeTab]}
-               onChange={(e) => setLocalSettings({
-                 ...localSettings, 
-                 projectTypePrompts: {
-                    ...localSettings.projectTypePrompts,
-                    [activeTab]: e.target.value
-                 }
-               })}
-               className="w-full h-40 bg-gray-900 border border-gray-600 rounded-lg p-4 text-white placeholder-gray-600 focus:border-green-500 focus:outline-none leading-relaxed text-sm"
-               placeholder={`输入 ${PROJECT_TYPE_LABELS[activeTab]} 的系统指令...`}
-             />
-             <p className="text-xs text-gray-500 mt-2">此文本将作为前缀添加到发送给 Gemini 的分析提示词中。</p>
+             <div className="space-y-4">
+                 <div>
+                     <label className="block text-xs font-bold text-blue-400 mb-1 uppercase tracking-wider">分镜生图提示词前缀</label>
+                     <textarea
+                        value={localSettings.projectTypePrompts[activeTab].storyboardImagePrefix}
+                        onChange={(e) => updatePrompt('storyboardImagePrefix', e.target.value)}
+                        className="w-full h-20 bg-gray-900 border border-gray-600 rounded-lg p-3 text-white text-sm focus:border-green-500 focus:outline-none"
+                     />
+                 </div>
+                 <div>
+                     <label className="block text-xs font-bold text-purple-400 mb-1 uppercase tracking-wider">图生视频提示词前缀</label>
+                     <textarea
+                        value={localSettings.projectTypePrompts[activeTab].videoGenerationPrefix}
+                        onChange={(e) => updatePrompt('videoGenerationPrefix', e.target.value)}
+                        className="w-full h-20 bg-gray-900 border border-gray-600 rounded-lg p-3 text-white text-sm focus:border-green-500 focus:outline-none"
+                     />
+                 </div>
+                 <div className="grid grid-cols-2 gap-4">
+                     <div>
+                         <label className="block text-xs font-bold text-yellow-400 mb-1 uppercase tracking-wider">角色提取提示词</label>
+                         <textarea
+                            value={localSettings.projectTypePrompts[activeTab].characterExtraction}
+                            onChange={(e) => updatePrompt('characterExtraction', e.target.value)}
+                            className="w-full h-32 bg-gray-900 border border-gray-600 rounded-lg p-3 text-white text-sm focus:border-green-500 focus:outline-none"
+                         />
+                     </div>
+                     <div>
+                         <label className="block text-xs font-bold text-green-400 mb-1 uppercase tracking-wider">场景提取提示词</label>
+                         <textarea
+                            value={localSettings.projectTypePrompts[activeTab].sceneExtraction}
+                            onChange={(e) => updatePrompt('sceneExtraction', e.target.value)}
+                            className="w-full h-32 bg-gray-900 border border-gray-600 rounded-lg p-3 text-white text-sm focus:border-green-500 focus:outline-none"
+                         />
+                     </div>
+                 </div>
+             </div>
           </section>
         </div>
 
@@ -494,7 +552,7 @@ const App: React.FC = () => {
 
   const [newProjectData, setNewProjectData] = useState<{name: string, type: ProjectType, settings: ProjectSettings}>({
     name: '',
-    type: 'NOVEL_VISUALIZATION',
+    type: 'REAL_PERSON_COMMENTARY',
     settings: { ...DEFAULT_SETTINGS }
   });
   
@@ -592,7 +650,7 @@ const App: React.FC = () => {
   const openCreateModal = () => {
     setNewProjectData({
       name: '',
-      type: 'NOVEL_VISUALIZATION',
+      type: 'REAL_PERSON_COMMENTARY',
       settings: { ...DEFAULT_SETTINGS }
     });
     setShowCreateModal(true);
@@ -933,8 +991,10 @@ const App: React.FC = () => {
     setIsProcessing(true);
     try {
       // 1. Get Settings for this Project Type
-      const systemInstruction = globalSettings.projectTypePrompts[currentProject.type];
+      const prompts = globalSettings.projectTypePrompts[currentProject.type];
       const model = globalSettings.extractionModel;
+      
+      const systemInstruction = `${prompts.characterExtraction}\n\n${prompts.sceneExtraction}`;
 
       // 2. Extract Assets
       const analysis = await analyzeNovelScript(currentEpisode.scriptContent, model, systemInstruction);
@@ -947,7 +1007,8 @@ const App: React.FC = () => {
       const mergedScenes = [...currentProject.scenes, ...newScenes];
 
       // 3. Breakdown Storyboard
-      const breakdown = await generateStoryboardBreakdown(currentEpisode.scriptContent, model, systemInstruction);
+      // Note: breakdown uses its own logic, we can also pass system instructions if needed, but current API doesn't use these specific prompts for breakdown structure, only extraction.
+      const breakdown = await generateStoryboardBreakdown(currentEpisode.scriptContent, model);
       const newFrames: StoryboardFrame[] = breakdown.frames.map((f, idx) => {
         // Map names to IDs
         const charIds = (f.characterNames || [])
@@ -997,9 +1058,11 @@ const App: React.FC = () => {
     
     setIsProcessing(true);
     try {
-      // Use Project Settings for Style
-      const style = currentProject.settings.imageStyle || '';
-      const prompt = `${style}, ${description}`;
+      // Use Project Settings for Style (Removed from settings, now using defaults or specific prompts if needed, but for assets we keep it simple or use the prefix from global settings?)
+      // User request only specified prefix for "Storyboard" images. For Assets, we might want to use the same prefix or keep it simple.
+      // Let's use the storyboard prefix to maintain consistency style-wise.
+      const prefix = globalSettings.projectTypePrompts[currentProject.type].storyboardImagePrefix;
+      const prompt = `${prefix}, ${description}`;
       // Assets usually 1:1
       const imageUrl = await generateImageAsset(prompt, '1:1', currentProject.settings.imageModel);
       
@@ -1070,12 +1133,14 @@ const App: React.FC = () => {
       }
 
       // 3. Generate
-      const style = currentProject.settings.imageStyle || 'Cinematic';
       const aspectRatio = currentProject.settings.aspectRatio || '16:9';
       const model = currentProject.settings.imageModel;
-      const enhancedPrompt = `${style}, ${prompt}`; 
       
-      const imageUrl = await generateImageAsset(enhancedPrompt, aspectRatio, model, referenceImages);
+      // Construct prompt: Prefix + Assets + Prompt
+      // The `generateImageAsset` service now accepts `stylePrefix` to handle this ordering.
+      const prefix = globalSettings.projectTypePrompts[currentProject.type].storyboardImagePrefix;
+      
+      const imageUrl = await generateImageAsset(prompt, aspectRatio, model, referenceImages, prefix);
 
       // 4. Update frame with image
       setProjects(prev => prev.map(p => {
@@ -1151,7 +1216,12 @@ const App: React.FC = () => {
       }
 
       const model = currentProject.settings.videoModel;
-      const videoUrl = await generateVideoFromImage(frame.imageUrl, frame.prompt, model);
+      
+      // Video Prompt Structure: Prefix + Frame Prompt
+      const prefix = globalSettings.projectTypePrompts[currentProject.type].videoGenerationPrefix;
+      const fullVideoPrompt = `${prefix} ${frame.prompt}`;
+
+      const videoUrl = await generateVideoFromImage(frame.imageUrl, fullVideoPrompt, model);
 
       // 4. Update frame with video
       setProjects(prev => prev.map(p => {
@@ -1358,8 +1428,8 @@ const App: React.FC = () => {
                          
                          <div>
                             <label className="block text-sm font-medium text-gray-400 mb-2">项目类型</label>
-                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                               {(['NOVEL_VISUALIZATION', 'SHORT_VIDEO', 'COMIC', 'OTHER'] as ProjectType[]).map(type => (
+                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                               {(['REAL_PERSON_COMMENTARY', 'COMMENTARY_2D', 'COMMENTARY_3D', 'PREMIUM_2D', 'PREMIUM_3D'] as ProjectType[]).map(type => (
                                  <button
                                    key={type}
                                    onClick={() => setNewProjectData({...newProjectData, type})}
@@ -1409,16 +1479,6 @@ const App: React.FC = () => {
                                 <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image (高质量)</option>
                               </select>
                             </div>
-                         </div>
-                         
-                         <div className="mb-4">
-                            <label className="block text-xs font-medium text-gray-500 mb-1 uppercase">艺术风格提示词</label>
-                            <textarea 
-                              value={newProjectData.settings.imageStyle} 
-                              onChange={e => setNewProjectData({...newProjectData, settings: {...newProjectData.settings, imageStyle: e.target.value}})}
-                              className="w-full bg-gray-900 border border-gray-600 rounded p-3 text-white text-sm h-24 focus:border-blue-500 focus:outline-none"
-                              placeholder="描述全局视觉风格（例如：赛博朋克, 霓虹灯光, 水彩画...）"
-                            />
                          </div>
                          
                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1593,6 +1653,14 @@ const App: React.FC = () => {
            setCurrentEpisodeId(null);
            setViewMode(ViewMode.PROJECT_DETAIL);
         }}
+        headerRight={
+            <button 
+              onClick={() => setShowGlobalSettingsModal(true)}
+              className="bg-gray-800 hover:bg-gray-700 text-gray-300 px-4 py-2 rounded-md transition flex items-center gap-2 text-sm border border-gray-700"
+            >
+              <Globe size={16} /> 全局设置
+            </button>
+        }
       >
         {activeTab === ProjectTab.SCRIPT && (
           <div className="max-w-4xl mx-auto h-full flex flex-col">
@@ -1619,6 +1687,7 @@ const App: React.FC = () => {
           </div>
         )}
 
+        {/* ... (ASSETS, STORYBOARD, EXPORT tabs remain unchanged conceptually, but logic for generation updates below) ... */}
         {activeTab === ProjectTab.ASSETS && (
           <div className="space-y-8 pb-12">
             <div className="bg-blue-900/20 border border-blue-900/50 p-4 rounded-lg flex gap-3 text-sm text-blue-200 mb-6">

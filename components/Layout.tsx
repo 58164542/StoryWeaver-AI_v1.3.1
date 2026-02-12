@@ -7,9 +7,10 @@ interface LayoutProps {
   onTabChange?: (tab: string) => void;
   title: string;
   onBack?: () => void;
+  headerRight?: React.ReactNode;
 }
 
-export const Layout: React.FC<LayoutProps> = ({ children, activeTab, onTabChange, title, onBack }) => {
+export const Layout: React.FC<LayoutProps> = ({ children, activeTab, onTabChange, title, onBack, headerRight }) => {
   return (
     <div className="flex h-screen bg-gray-900 text-gray-100">
       {/* Sidebar */}
@@ -64,10 +65,9 @@ export const Layout: React.FC<LayoutProps> = ({ children, activeTab, onTabChange
         <header className="h-16 bg-gray-900 border-b border-gray-800 flex items-center justify-between px-6 shrink-0">
           <h1 className="text-xl font-semibold text-white truncate max-w-xl">{title}</h1>
           <div className="flex items-center gap-4">
-            <button className="bg-gray-800 hover:bg-gray-700 text-sm px-4 py-2 rounded-md transition">
-              帮助
-            </button>
-            <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 border-2 border-gray-800"></div>
+            {headerRight ? headerRight : (
+              <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-blue-500 to-purple-500 border-2 border-gray-800"></div>
+            )}
           </div>
         </header>
 

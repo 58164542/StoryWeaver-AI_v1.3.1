@@ -6,10 +6,6 @@ import { AnalysisResult, StoryboardBreakdown } from "../types";
 // but keep a default one for general text/image tasks.
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-// Constants for models
-// const TEXT_MODEL = 'gemini-3-flash-preview'; // REMOVED: Now passed dynamically
-// const IMAGE_MODEL = 'gemini-2.5-flash-image'; // Passed dynamically or default
-
 export const analyzeNovelScript = async (
   text: string, 
   model: string = 'gemini-3-flash-preview',
@@ -144,32 +140,40 @@ export const generateImageAsset = async (
   prompt: string, 
   aspectRatio: '16:9' | '1:1' | '9:16' | '4:3' | '3:4' = '16:9',
   model: string = 'gemini-2.5-flash-image',
-  referenceImages: ReferenceImage[] = []
+  referenceImages: ReferenceImage[] = [],
+  stylePrefix: string = ''
 ): Promise<string> => {
   try {
     const parts: any[] = [];
 
-    // Add reference images first
-    // And build a prefix prompt to explain references
-    let referenceContext = "";
+    // Construct text prompt following the structure:
+    // [Prefix] + [Reference Assets Context] + [Frame Prompt]
     
+    let fullTextPrompt = "";
+    
+    if (stylePrefix) {
+      fullTextPrompt += `${stylePrefix}\n\n`;
+    }
+
     if (referenceImages.length > 0) {
-      referenceContext += "Reference Images:\n";
+      fullTextPrompt += "Reference Assets:\n";
       referenceImages.forEach((img, index) => {
-        // Add image part
+        // Add image part to the payload
         parts.push({
           inlineData: {
             mimeType: img.mimeType,
             data: img.data
           }
         });
-        referenceContext += `Image ${index + 1}: ${img.name}\n`;
+        fullTextPrompt += `Image ${index + 1}: ${img.name}\n`;
       });
-      referenceContext += "Use the above images as strict references for the characters/scenes described below.\n\n";
+      fullTextPrompt += "Use the above images as strict references for the characters/scenes described below.\n\n";
     }
 
-    // Add the main prompt text
-    parts.push({ text: referenceContext + "Prompt: " + prompt });
+    fullTextPrompt += `Storyboard Content: ${prompt}`;
+
+    // Add the constructed text part
+    parts.push({ text: fullTextPrompt });
 
     const response = await ai.models.generateContent({
       model: model,

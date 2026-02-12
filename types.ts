@@ -12,11 +12,18 @@ export enum ProjectTab {
   EXPORT = 'EXPORT',
 }
 
-export type ProjectType = 'NOVEL_VISUALIZATION' | 'SHORT_VIDEO' | 'COMIC' | 'OTHER';
+export type ProjectType = 'REAL_PERSON_COMMENTARY' | 'COMMENTARY_2D' | 'COMMENTARY_3D' | 'PREMIUM_2D' | 'PREMIUM_3D';
+
+export interface ProjectTypeInstruction {
+  storyboardImagePrefix: string; // 分镜生图提示词前缀
+  videoGenerationPrefix: string; // 图生视频提示词前缀
+  characterExtraction: string;   // 角色提取提示词
+  sceneExtraction: string;       // 场景提取提示词
+}
 
 export interface GlobalSettings {
   extractionModel: string;
-  projectTypePrompts: Record<ProjectType, string>;
+  projectTypePrompts: Record<ProjectType, ProjectTypeInstruction>;
 }
 
 export interface ProjectSettings {
@@ -24,7 +31,7 @@ export interface ProjectSettings {
   videoModel: string;
   ttsModel: string;
   aspectRatio: '16:9' | '9:16' | '1:1' | '4:3' | '3:4';
-  imageStyle: string; // e.g. "Cinematic", "Anime", "Oil Painting"
+  // imageStyle removed as requested
 }
 
 export interface Character {
