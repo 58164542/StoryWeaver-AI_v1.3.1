@@ -29,6 +29,9 @@ data/recycle_bin/
 # Local reference and test assets
 参考图/
 提示词test/
+pyJianYingDraft-0.2.5/readme_assets/
+test-global-settings.html
+dosdel.bat
 
 # Local caches and virtual envs
 env/
