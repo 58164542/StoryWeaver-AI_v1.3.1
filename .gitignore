@@ -26,6 +26,10 @@ data/media/
 data/exports/
 data/recycle_bin/
 
+# Local reference and test assets
+参考图/
+提示词test/
+
 # Local caches and virtual envs
 env/
 .claude/
