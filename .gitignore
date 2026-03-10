@@ -1,0 +1,48 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies and build output
+node_modules
+dist
+dist-ssr
+coverage
+*.tsbuildinfo
+
+# Local env files
+*.local
+.env
+.env.*
+!.env.example
+
+# Runtime data and generated media
+data/db.json
+data/media/
+data/exports/
+data/recycle_bin/
+
+# Local caches and virtual envs
+env/
+.claude/
+.settings.local.json
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
