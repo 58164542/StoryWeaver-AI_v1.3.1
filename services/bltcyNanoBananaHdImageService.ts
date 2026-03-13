@@ -14,6 +14,7 @@ import { buildPromptWithRefs } from "../utils/imagePromptUtils";
 
 const BLTCY_IMAGES_API_URL = "https://api.bltcy.ai/v1/images/generations";
 const BLTCY_NANO_BANANA_HD_MODEL = "nano-banana-hd";
+const BLTCY_NANO_BANANA_PRO_MODEL = "nano-banana-pro";
 
 interface ReferenceImage {
   name: string;
@@ -92,6 +93,15 @@ export const generateImageWithBltcyNanoBananaHd = async (
   // 记录 aspectRatio（若上游不支持也无害），便于排查
   requestBody.aspect_ratio = aspectRatio;
 
+  console.log('[生图请求][柏拉图 Nano Banana HD]', {
+    model,
+    prompt: fullPrompt,
+    promptLength: fullPrompt.length,
+    aspectRatio,
+    referenceImagesCount: referenceImages.length,
+    uploadedReferenceCount: referenceUrls.length,
+  });
+
   Logger.logRequest("BltcyNanoBananaHd", "images/generations", BLTCY_IMAGES_API_URL, {
     model,
     aspectRatio,
@@ -132,3 +142,19 @@ export const generateImageWithBltcyNanoBananaHd = async (
 
   throw new Error("未从柏拉图中转响应中获取到图片（缺少 url/b64_json）");
 };
+
+export const generateImageWithBltcyNanoBananaPro = async (
+  prompt: string,
+  aspectRatio: string = "16:9",
+  referenceImages: ReferenceImage[] = [],
+  projectId: string,
+  onProgress?: ProgressCallback
+): Promise<string> =>
+  generateImageWithBltcyNanoBananaHd(
+    prompt,
+    aspectRatio,
+    referenceImages,
+    projectId,
+    onProgress,
+    BLTCY_NANO_BANANA_PRO_MODEL
+  );

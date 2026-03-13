@@ -62,6 +62,14 @@ export const generateImageWithJarvisNanoBanana2 = async (
   };
 
   const url = `${JARVIS_BASE_URL}/v1beta/models/${JARVIS_MODEL}:generateContent?key=${apiKey}`;
+  console.log('[生图请求][Jarvis]', {
+    model: JARVIS_MODEL,
+    prompt: fullPrompt,
+    promptLength: fullPrompt.length,
+    aspectRatio,
+    referenceImagesCount: referenceImages.length,
+    uploadedReferenceCount: refParts.length,
+  });
   Logger.logRequest('JarvisImage', 'generateContent', url, { model: JARVIS_MODEL, aspectRatio, refCount: refParts.length });
 
   if (onProgress) onProgress(10);

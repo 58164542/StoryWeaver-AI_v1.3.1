@@ -28,6 +28,7 @@ export default defineConfig(({ mode }) => {
         'process.env.NEX_API_KEY': JSON.stringify(env.NEX_API_KEY),
         'process.env.JARVIS_API_KEY': JSON.stringify(env.JARVIS_API_KEY),
         'process.env.BLTCY_API_KEY': JSON.stringify(env.BLTCY_API_KEY),
+        'process.env.BLTCY_WAN_API_KEY': JSON.stringify(env.BLTCY_WAN_API_KEY),
         'process.env.GITHUB_TOKEN': JSON.stringify(env.GITHUB_TOKEN),
         'process.env.GITHUB_OWNER': JSON.stringify(env.GITHUB_OWNER),
         'process.env.GITHUB_REPO': JSON.stringify(env.GITHUB_REPO),

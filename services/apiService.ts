@@ -261,6 +261,20 @@ export async function exportEpisodeStoryboardImagesZip(projectId: string, episod
   };
 }
 
+/**
+ * 导出当前项目的资产图 ZIP
+ */
+export async function exportProjectAssetImagesZip(projectId: string) {
+  const data = await request(`/api/projects/${projectId}/asset-images/export`, {
+    method: 'POST',
+  });
+
+  return {
+    ...data,
+    downloadUrl: typeof data?.downloadUrl === 'string' ? toAbsoluteApiUrl(data.downloadUrl) : data?.downloadUrl,
+  };
+}
+
 // ==================== 健康检查 ====================
 
 /**
@@ -308,5 +322,6 @@ export default {
   deleteMedia,
   getMediaUrl,
   exportEpisodeStoryboardImagesZip,
+  exportProjectAssetImagesZip,
   checkHealth,
 };

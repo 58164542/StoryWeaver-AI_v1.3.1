@@ -195,9 +195,10 @@ export const generateImageWithVolcengine = async (
   }
 
   try {
-    console.log('[火山引擎] 发送请求', {
+    console.log('[生图请求][火山引擎]', {
       url: VOLCENGINE_IMAGE_API_URL,
       model: requestBody.model,
+      prompt: requestBody.prompt,
       promptLength: requestBody.prompt.length,
       size: requestBody.size,
       stream: requestBody.stream,

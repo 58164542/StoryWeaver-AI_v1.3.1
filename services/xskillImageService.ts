@@ -82,6 +82,15 @@ export const generateImageWithXskillNanoBanana2 = async (
     channel: null,
   };
 
+  console.log('[生图请求][Xskill]', {
+    model: createPayload.model,
+    prompt: fullPrompt,
+    promptLength: fullPrompt.length,
+    aspectRatio,
+    referenceImagesCount: referenceImages.length,
+    uploadedReferenceCount: imageUrls.length,
+  });
+
   Logger.logRequest('XskillImage', 'createTask', XSKILL_CREATE_URL, createPayload);
 
   const createResponse = await fetch(XSKILL_CREATE_URL, {

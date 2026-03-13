@@ -136,6 +136,12 @@ GRSAI_API_KEY=你的香蕉Pro密钥
 # 速推 Seedance 2.0 API 密钥
 NEX_API_KEY=你的速推密钥
 
+# 柏拉图视频中转 API 密钥（Sora 2 / Veo 3.1）
+BLTCY_API_KEY=你的柏拉图视频密钥
+
+# 柏拉图 Wan 2.6 专用 API 密钥
+BLTCY_WAN_API_KEY=你的柏拉图Wan密钥
+
 # GitHub 图床配置（用于 Seedance 2.0）
 GITHUB_TOKEN=你的GitHub_Token
 GITHUB_OWNER=你的GitHub用户名
@@ -297,6 +303,7 @@ lsof -ti:3000 | xargs kill -9
 2. 确认没有拼写错误
 3. 重启开发服务器（Ctrl+C 后重新 `npm run dev`）
 4. 检查 `vite.config.ts` 中的 `define` 配置
+5. 如果使用柏拉图 Wan 2.6，确认已配置 `BLTCY_WAN_API_KEY`
 
 ---
 

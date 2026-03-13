@@ -94,6 +94,15 @@ export const generateImageWithBltcyBanana2 = async (
   // 记录 aspectRatio（若上游不支持也无害），便于排查
   requestBody.aspect_ratio = aspectRatio;
 
+  console.log('[生图请求][柏拉图 One-API]', {
+    model,
+    prompt: fullPrompt,
+    promptLength: fullPrompt.length,
+    aspectRatio,
+    referenceImagesCount: referenceImages.length,
+    uploadedReferenceCount: referenceUrls.length,
+  });
+
   Logger.logRequest("BltcyOneApiImage", "images/generations", BLTCY_ONE_API_URL, {
     model,
     aspectRatio,

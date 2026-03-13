@@ -2,6 +2,7 @@
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { AnalysisResult, StoryboardBreakdown, StoryboardBreakdownFrame, StoryboardDialogueLine } from "../types";
 import { Logger } from "../utils/logger";
+import { buildPromptWithRefs } from "../utils/imagePromptUtils";
 
 function stripGeminiNonJson(text: string): string {
   let cleaned = text.trim();
@@ -433,32 +434,32 @@ export const generateImageAsset = async (
       fullTextPrompt += `${stylePrefix}\n\n`;
     }
 
+    const promptWithRefs = buildPromptWithRefs(prompt, referenceImages);
+
     if (referenceImages.length > 0) {
-      fullTextPrompt += "Reference Assets:\n";
-      referenceImages.forEach((img, index) => {
-        // Add image part to the payload
+      referenceImages.forEach((img) => {
         parts.push({
           inlineData: {
             mimeType: img.mimeType,
             data: img.data
           }
         });
-        fullTextPrompt += `Image ${index + 1}: ${img.name}\n`;
       });
-      fullTextPrompt += "Use the above images as strict references for the characters/scenes described below.\n\n";
     }
 
-    fullTextPrompt += `Storyboard Content: ${prompt}`;
+    fullTextPrompt += promptWithRefs;
 
     // Add the constructed text part
     parts.push({ text: fullTextPrompt });
 
-    console.log('[Gemini] 发送请求', {
+    console.log('[生图请求][Gemini]', {
       model,
       aspectRatio,
+      prompt: fullTextPrompt,
+      promptLength: fullTextPrompt.length,
+      referenceImagesCount: referenceImages.length,
       partsCount: parts.length,
-      partsTypes: parts.map(p => p.inlineData ? `inlineData(${p.inlineData.mimeType}, len=${p.inlineData.data?.length})` : 'text'),
-      promptLength: fullTextPrompt.length
+      partsTypes: parts.map(p => p.inlineData ? `inlineData(${p.inlineData.mimeType}, len=${p.inlineData.data?.length})` : 'text')
     });
 
     const requestConfig = {

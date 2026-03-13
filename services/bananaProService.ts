@@ -118,10 +118,11 @@ async function attemptOnce(
   onProgress?: ProgressCallback,
   attempt: number = 1
 ): Promise<string> {
-  console.log('[香蕉Pro] 发送请求', {
+  console.log('[生图请求][香蕉Pro]', {
     attempt,
     url: BANANA_PRO_API_URL,
     model: requestBody.model,
+    prompt: requestBody.prompt,
     promptLength: requestBody.prompt.length,
     aspectRatio: requestBody.aspectRatio,
     imageSize: requestBody.imageSize,

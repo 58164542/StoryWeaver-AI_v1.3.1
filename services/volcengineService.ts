@@ -4,6 +4,8 @@ import { Logger } from "../utils/logger";
 const VOLCENGINE_API_URL = "https://ark.cn-beijing.volces.com/api/v3/responses";
 const VOLCENGINE_VIDEO_API_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks";
 const GRSAI_CHAT_API_URL = "https://grsaiapi.com/v1/chat/completions";
+const VOLCENGINE_CONNECTIVITY_TIMEOUT_MS = 60;
+const VOLCENGINE_CONNECTIVITY_MODEL = "doubao-seed-1-6-250615";
 
 /**
  * 清理JSON响应，移除可能的markdown代码块标记和修复常见格式问题
@@ -250,6 +252,7 @@ interface VolcengineRequest {
   thinking?: {
     type: string;
   };
+  max_output_tokens?: number;
   stream?: boolean;
   text?: {
     format?: {
@@ -286,6 +289,53 @@ interface GrsaiChatResponse {
       content?: string;
     };
   }>;
+}
+
+export async function checkVolcengineConnectivity(timeoutMs: number = VOLCENGINE_CONNECTIVITY_TIMEOUT_MS): Promise<{ ok: boolean; error?: string }> {
+  const apiKey = process.env.ARK_API_KEY;
+  if (!apiKey || apiKey === 'PLACEHOLDER_API_KEY') {
+    return { ok: false, error: '请在 .env.local 文件中配置 ARK_API_KEY' };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(VOLCENGINE_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: VOLCENGINE_CONNECTIVITY_MODEL,
+        input: [{
+          role: 'user',
+          content: [{ type: 'input_text', text: 'ping' }]
+        }],
+        max_output_tokens: 1,
+        stream: false
+      }),
+      signal: controller.signal
+    });
+
+    if (response.ok) {
+      return { ok: true };
+    }
+
+    const errorText = await response.text();
+    return {
+      ok: false,
+      error: `豆包服务不可用（${response.status}）: ${errorText || response.statusText}`
+    };
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      return { ok: false, error: `豆包服务连通性检测超时（>${timeoutMs}ms）` };
+    }
+    return { ok: false, error: error instanceof Error ? error.message : '豆包服务连通性检测失败' };
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 /**
@@ -334,6 +384,7 @@ async function callVolcengineAPI(
     thinking: {
       type: "enabled"
     },
+    max_output_tokens: 100000,
     stream: false
   };
 
@@ -452,6 +503,7 @@ async function callGrsaiChatAPI(
     model,
     stream: false,
     messages,
+    max_output_tokens: 100000,
     // Grsai 中转的 Gemini 系列模型不支持 json_schema 类型，使用 json_object 确保输出 JSON 格式
     response_format: schema && schemaName ? {
       type: "json_object"
@@ -568,7 +620,7 @@ export const analyzeNovelScript = async (
   const prompt = `
 分析以下小说文本，提取关键角色、角色变体和场景。
 
-对于 characters，提取角色完整基础形象，输出字段包含：name（名字，禁止括号注释）、aliases（脚本中出现的别名/别称列表）、description（描述）、appearance（完整基础形象：面部外貌、发型、体态 + 年龄 + 日常常服/默认服装；常服必须写入此字段，不得作为变体）、personality（性格）、role（角色类型：Protagonist/Antagonist/Supporting）。
+对于 characters，提取角色完整基础形象，输出字段包含：name（名字，禁止括号注释）、aliases（脚本中出现的别名/别称列表）、description（描述）、appearance（完整基础形象：面部外貌、发型、体态 + 年龄、性别、身份气质 + 日常常服/默认服装；常服必须写入此字段，不得作为变体）、personality（性格）、role（角色类型：Protagonist/Antagonist/Supporting）。
 
 对于 variants（角色服装/外貌变体）：【严格规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体XX"格式）。常服/日常装束/默认服装不得作为变体提取，应归入主体 appearance 字段。输出字段：characterName（对应角色的 name，必须完全匹配）、name（变体名）、context（出现场景）、appearance（变体专属外貌描述，包含衣着、配饰等具体细节）。
 
@@ -721,7 +773,7 @@ export const generateStoryboardBreakdown = async (
 
 每个 frame 应包含：
 - imagePrompt: 详细的静态画面描述，用于图像生成器。重点描述单帧的构图、人物外貌/姿态、场景环境、光线氛围，要求画面内容具体、静态感强，适合直接生成分镜图片。（图片提示词严禁使用线性时间描述、严禁使用一个以上的动作词汇）
-- videoPrompt: 一组详细连贯的视觉描述，用于视频生成器。要求按照分镜拆解提示词要求详细阐述清楚剧情背景和视频内容，必须包含详细的起承转合线性时间动作，将单调的镜头语言动作具象化，如果原文内容不足以支撑起一段连贯的动作镜头，酌情加以补充细节和裂变镜头。
+- videoPrompt: 一组详细连贯的视觉描述，用于视频生成器。要求按照分镜拆解提示词要求详细阐述清楚剧情背景和视频内容，必须包含详细的起承转合线性时间动作，将单调的镜头语言动作具象化，如果原文内容不足以支撑起一段连贯的动作镜头，酌情加以补充细节和裂变镜头。如果原文包含对白/旁白，也加以保留输出。
 - dialogues: 结构化对话数组（可选），每项为 { speakerName, text }
   - speakerName: 必须使用候选角色的 name（不要输出别称/外号/括号注释）；旁白/未知说话人请省略 speakerName
   - text: 台词内容

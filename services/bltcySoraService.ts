@@ -4,6 +4,15 @@ import { readMediaAsBase64 } from "./apiService";
 
 const BLTCY_BASE_URL = "https://api.bltcy.ai";
 const BLTCY_MODEL = "sora-2";
+const BLTCY_WAN_MODEL = "wan2.6-i2v";
+
+const getBltcyApiKey = (envKey: "BLTCY_API_KEY" | "BLTCY_WAN_API_KEY"): string => {
+  const apiKey = process.env[envKey];
+  if (!apiKey || apiKey === "PLACEHOLDER_API_KEY") {
+    throw new Error(`请在 .env.local 文件中配置 ${envKey}`);
+  }
+  return apiKey;
+};
 
 interface BltcyVideoJob {
   task_id: string;
@@ -50,6 +59,106 @@ const isPublicHttpUrl = (value: string): boolean => {
   return true;
 };
 
+const blobToDataUrl = (blob: Blob): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error ?? new Error("读取图片失败"));
+    reader.readAsDataURL(blob);
+  });
+
+const convertBlobToJpegDataUrl = (blob: Blob): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(blob);
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        reject(new Error("canvas 不可用"));
+        return;
+      }
+      ctx.drawImage(img, 0, 0);
+      canvas.toBlob(async jpegBlob => {
+        if (!jpegBlob) {
+          reject(new Error("JPEG 转换失败"));
+          return;
+        }
+        try {
+          resolve(await blobToDataUrl(jpegBlob));
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error("JPEG 读取失败"));
+        }
+      }, "image/jpeg", 0.92);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("图片加载失败"));
+    };
+    img.src = objectUrl;
+  });
+
+const isWanSupportedMimeType = (mimeType: string): boolean => {
+  const normalized = mimeType.toLowerCase();
+  return normalized === "image/jpeg" || normalized === "image/jpg" || normalized === "image/png";
+};
+
+const normalizeDataUrlForWan = async (dataUrl: string): Promise<string> => {
+  const mimeType = dataUrl.match(/^data:([^;]+);base64,/)?.[1] ?? "image/jpeg";
+  if (isWanSupportedMimeType(mimeType)) return dataUrl;
+  const blob = await fetch(dataUrl).then(response => response.blob());
+  return await convertBlobToJpegDataUrl(blob);
+};
+
+const ensureWanCompatibleImageUrl = async (
+  imageUrl: string,
+  githubImageUrl: string | undefined,
+  projectId: string
+): Promise<string> => {
+  const primarySource = normalizeImageUrlInput(imageUrl);
+  const fallbackSource = normalizeImageUrlInput(githubImageUrl ?? "");
+  const source = primarySource || fallbackSource;
+  if (!source) {
+    throw new Error("生成视频失败: 缺少参考图");
+  }
+
+  let dataUrl: string;
+  if (isBase64DataUrl(source)) {
+    dataUrl = source;
+  } else if (/^https?:\/\//i.test(source)) {
+    try {
+      const response = await fetch(source);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      dataUrl = await blobToDataUrl(await response.blob());
+    } catch (error) {
+      if (source !== fallbackSource && fallbackSource && /^https?:\/\//i.test(fallbackSource)) {
+        const fallbackResponse = await fetch(fallbackSource);
+        if (!fallbackResponse.ok) {
+          throw error;
+        }
+        dataUrl = await blobToDataUrl(await fallbackResponse.blob());
+      } else if (isPublicHttpUrl(source)) {
+        Logger.logInfo("BltcyWan 远程图片抓取失败，回退为直接使用公网 URL", { imageUrl: source });
+        return source;
+      } else {
+        throw error;
+      }
+    }
+  } else {
+    dataUrl = await readMediaAsBase64(source);
+  }
+
+  const normalizedDataUrl = await normalizeDataUrlForWan(dataUrl);
+  const uploadedUrl = await uploadImageToGitHub(normalizedDataUrl, projectId);
+  Logger.logInfo("BltcyWan 兼容图上传成功", { githubUrl: uploadedUrl });
+  return uploadedUrl;
+};
+
 export const generateVideoWithBltcySora = async (
   imageUrl: string,
   prompt: string,
@@ -59,17 +168,22 @@ export const generateVideoWithBltcySora = async (
   onProgress?: (progress: number) => void,
   githubImageUrl?: string,
   model: string = BLTCY_MODEL,
-  imageAsString: boolean = false
+  imageAsString: boolean = false,
+  apiKeyEnv: "BLTCY_API_KEY" | "BLTCY_WAN_API_KEY" = "BLTCY_API_KEY"
 ): Promise<string> => {
-  const apiKey = process.env.BLTCY_API_KEY;
-  if (!apiKey || apiKey === "PLACEHOLDER_API_KEY") {
-    throw new Error("请在 .env.local 文件中配置 BLTCY_API_KEY");
-  }
+  const apiKey = getBltcyApiKey(apiKeyEnv);
 
   // 确保图片 URL 为可公开访问的地址
   let finalImageUrl: string;
   const normalizedImageUrl = normalizeImageUrlInput(imageUrl);
-  if (githubImageUrl) {
+  if (apiKeyEnv === "BLTCY_WAN_API_KEY") {
+    try {
+      finalImageUrl = await ensureWanCompatibleImageUrl(normalizedImageUrl, githubImageUrl, projectId);
+    } catch (error) {
+      Logger.logError("BltcyWan", "图片准备失败", error);
+      throw new Error(`图片上传到 GitHub 失败: ${error instanceof Error ? error.message : "未知错误"}`);
+    }
+  } else if (githubImageUrl) {
     Logger.logInfo("BltcySora 使用已有 GitHub URL", { githubImageUrl });
     finalImageUrl = githubImageUrl;
   } else if (isBase64DataUrl(normalizedImageUrl)) {
@@ -202,3 +316,25 @@ export const generateVideoWithBltcyVeo3 = (
   githubImageUrl?: string
 ): Promise<string> =>
   generateVideoWithBltcySora(imageUrl, prompt, aspectRatio, duration, projectId, onProgress, githubImageUrl, "veo3.1", true);
+
+export const generateVideoWithBltcyWan26 = (
+  imageUrl: string,
+  prompt: string,
+  aspectRatio: "16:9" | "9:16" | "1:1" | "4:3" | "3:4",
+  duration: number = 5,
+  projectId: string,
+  onProgress?: (progress: number) => void,
+  githubImageUrl?: string
+): Promise<string> =>
+  generateVideoWithBltcySora(
+    imageUrl,
+    prompt,
+    aspectRatio,
+    duration,
+    projectId,
+    onProgress,
+    githubImageUrl,
+    BLTCY_WAN_MODEL,
+    true,
+    "BLTCY_WAN_API_KEY"
+  );

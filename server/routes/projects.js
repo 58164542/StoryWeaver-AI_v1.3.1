@@ -16,7 +16,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const RECYCLE_DIR = join(__dirname, '../../data/recycle_bin');
 const EXPORT_DIR = join(__dirname, '../../data/exports');
 const STORYBOARD_ZIP_TTL_MS = 30 * 60 * 1000;
+const ASSET_ZIP_TTL_MS = 30 * 60 * 1000;
 const storyboardZipDownloads = new Map();
+const assetZipDownloads = new Map();
 
 function sanitizeFileSegment(value, fallback = '未命名') {
   const sanitized = String(value || '')
@@ -47,6 +49,24 @@ function cleanupStoryboardZipToken(token) {
 function scheduleStoryboardZipCleanup(token, zipPath) {
   const timeoutId = setTimeout(() => cleanupStoryboardZipToken(token), STORYBOARD_ZIP_TTL_MS);
   storyboardZipDownloads.set(token, { zipPath, timeoutId });
+}
+
+function cleanupAssetZipToken(token) {
+  const entry = assetZipDownloads.get(token);
+  if (!entry) return;
+
+  assetZipDownloads.delete(token);
+  clearTimeout(entry.timeoutId);
+  fs.unlink(entry.zipPath).catch(error => {
+    if (error.code !== 'ENOENT') {
+      console.error('清理临时资产 ZIP 失败:', error);
+    }
+  });
+}
+
+function scheduleAssetZipCleanup(token, zipPath) {
+  const timeoutId = setTimeout(() => cleanupAssetZipToken(token), ASSET_ZIP_TTL_MS);
+  assetZipDownloads.set(token, { zipPath, timeoutId });
 }
 
 /**
@@ -429,6 +449,161 @@ router.get('/:id/episodes/:episodeId/storyboard-images/download/:token', async (
     stream.pipe(res);
   } catch (error) {
     cleanupStoryboardZipToken(token);
+    return res.status(404).json({ success: false, error: '下载文件不存在或已过期' });
+  }
+});
+
+/**
+ * POST /api/projects/:id/asset-images/export
+ * 生成当前项目资产图 ZIP 并返回临时下载链接
+ */
+router.post('/:id/asset-images/export', async (req, res) => {
+  try {
+    const { id: projectId } = req.params;
+    const db = getDatabase();
+    const project = db.data.projects.find(p => p.id === projectId);
+
+    if (!project) {
+      return res.status(404).json({ success: false, error: '项目不存在' });
+    }
+
+    const usedNames = new Set();
+    const exportableAssets = [];
+    let skippedCount = 0;
+    const characterNameMap = new Map((project.characters || []).map(character => [character.id, character.name]));
+
+    const buildUniqueZipEntryName = (baseName, extension) => {
+      let zipEntryName = `${baseName}${extension}`;
+      if (usedNames.has(zipEntryName)) {
+        let duplicateIndex = 2;
+        do {
+          zipEntryName = `${baseName}_${duplicateIndex}${extension}`;
+          duplicateIndex += 1;
+        } while (usedNames.has(zipEntryName));
+      }
+      usedNames.add(zipEntryName);
+      return zipEntryName;
+    };
+
+    const collectAssetImage = async (imageUrl, baseName) => {
+      if (!imageUrl) {
+        skippedCount += 1;
+        return;
+      }
+
+      const parsed = extractFilenameFromUrl(imageUrl);
+      if (!parsed || parsed.type !== 'images') {
+        skippedCount += 1;
+        return;
+      }
+
+      const mediaPath = getMediaPath('images', parsed.filename);
+      try {
+        await fs.access(mediaPath);
+      } catch {
+        skippedCount += 1;
+        return;
+      }
+
+      const originalExt = extname(parsed.filename) || '.jpg';
+      const zipEntryName = buildUniqueZipEntryName(baseName, originalExt);
+      exportableAssets.push({ mediaPath, zipEntryName });
+    };
+
+    for (const character of project.characters || []) {
+      const safeCharacterName = sanitizeFileSegment(character.name, '未命名角色');
+      await collectAssetImage(character.imageUrl, `CHAR_${safeCharacterName}`);
+    }
+
+    for (const variant of project.variants || []) {
+      const safeVariantName = sanitizeFileSegment(variant.name, '未命名变体');
+      const parentCharacterName = characterNameMap.get(variant.characterId);
+      const safeParentName = parentCharacterName ? sanitizeFileSegment(parentCharacterName, '未命名角色') : '';
+      const baseName = safeParentName
+        ? `VAR_${safeParentName}_${safeVariantName}`
+        : `VAR_${safeVariantName}`;
+      await collectAssetImage(variant.imageUrl, baseName);
+    }
+
+    for (const scene of project.scenes || []) {
+      const safeSceneName = sanitizeFileSegment(scene.name, '未命名场景');
+      await collectAssetImage(scene.imageUrl, `SCENE_${safeSceneName}`);
+    }
+
+    if (exportableAssets.length === 0) {
+      return res.status(400).json({ success: false, error: '当前项目没有可导出的资产图' });
+    }
+
+    await fs.mkdir(EXPORT_DIR, { recursive: true });
+
+    const filename = `${project.id}_${Date.now()}_asset_images.zip`;
+    const zipPath = join(EXPORT_DIR, filename);
+    const zip = new JSZip();
+
+    for (const item of exportableAssets) {
+      const buffer = await fs.readFile(item.mediaPath);
+      zip.file(item.zipEntryName, buffer);
+    }
+
+    const zipBuffer = await zip.generateAsync({
+      type: 'nodebuffer',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 },
+    });
+
+    await fs.writeFile(zipPath, zipBuffer);
+
+    const token = uuidv4();
+    scheduleAssetZipCleanup(token, zipPath);
+    const safeProjectName = sanitizeFileSegment(project.name, '未命名项目');
+
+    return res.json({
+      success: true,
+      data: {
+        downloadUrl: `/api/projects/${projectId}/asset-images/download/${token}`,
+        filename: `P_${safeProjectName}_asset_images.zip`,
+        exportedCount: exportableAssets.length,
+        skippedCount,
+      },
+    });
+  } catch (error) {
+    console.error('导出资产图 ZIP 失败:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/projects/:id/asset-images/download/:token
+ * 下载当前项目资产图 ZIP
+ */
+router.get('/:id/asset-images/download/:token', async (req, res) => {
+  const { token } = req.params;
+  const entry = assetZipDownloads.get(token);
+
+  if (!entry) {
+    return res.status(404).json({ success: false, error: '下载链接已失效或不存在' });
+  }
+
+  try {
+    await fs.access(entry.zipPath);
+
+    const downloadName = sanitizeFileSegment(req.query.filename, 'asset_images.zip');
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeContentDispositionFilename(downloadName)}`);
+
+    const stream = createReadStream(entry.zipPath);
+    stream.on('error', error => {
+      console.error('读取资产 ZIP 失败:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, error: '读取 ZIP 文件失败' });
+      } else {
+        res.end();
+      }
+    });
+
+    stream.pipe(res);
+  } catch (error) {
+    cleanupAssetZipToken(token);
     return res.status(404).json({ success: false, error: '下载文件不存在或已过期' });
   }
 });

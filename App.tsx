@@ -5,16 +5,17 @@ import {
 } from './types';
 import { Layout } from './components/Layout';
 import { analyzeNovelScript as analyzeNovelScriptGemini, generateStoryboardBreakdown as generateStoryboardBreakdownGemini, generateImageAsset, generateVideoFromImage, generateSpeech } from './services/geminiService';
-import { analyzeNovelScript as analyzeNovelScriptVolcengine, analyzeNovelScriptWithGrsai, generateStoryboardBreakdown as generateStoryboardBreakdownVolcengine, generateStoryboardBreakdownWithGrsai, generateVideoWithVolcengine, rewriteImagePromptForPolicyCompliance } from './services/volcengineService';
+import { analyzeNovelScript as analyzeNovelScriptVolcengine, analyzeNovelScriptWithGrsai, checkVolcengineConnectivity, generateStoryboardBreakdown as generateStoryboardBreakdownVolcengine, generateStoryboardBreakdownWithGrsai, generateVideoWithVolcengine, rewriteImagePromptForPolicyCompliance } from './services/volcengineService';
 import { generateVideoWithSeedance, generateVideoWithSeedanceMultiRef } from './services/seedanceService';
 import { generateVideoWithSora } from './services/soraService';
-import { generateVideoWithBltcySora, generateVideoWithBltcyVeo3 } from './services/bltcySoraService';
+import { generateVideoWithKlingOmni } from './services/klingService';
+import { generateVideoWithBltcySora, generateVideoWithBltcyVeo3, generateVideoWithBltcyWan26 } from './services/bltcySoraService';
 import { generateImageWithBananaPro } from './services/bananaProService';
 import { generateImageWithVolcengine } from './services/volcengineImageService';
 import { generateImageWithXskillNanoBanana2 } from './services/xskillImageService';
 import { generateImageWithJarvisNanoBanana2 } from './services/jarvisImageService';
 import { generateImageWithBltcyBanana2 } from './services/bltcyOneApiImageService';
-import { generateImageWithBltcyNanoBananaHd } from './services/bltcyNanoBananaHdImageService';
+import { generateImageWithBltcyNanoBananaHd, generateImageWithBltcyNanoBananaPro } from './services/bltcyNanoBananaHdImageService';
 import { exportToJianying } from './services/jianyingService';
 import { Logger } from './utils/logger';
 import { taskQueue } from './utils/taskQueue';
@@ -122,6 +123,7 @@ const normalizeProject = (project: Project): Project => ({
   },
   episodes: (project.episodes ?? []).map(episode => ({
     ...episode,
+    isProcessing: false,
     frames: (episode.frames ?? []).map(frame => {
       // 强制迁移：旧帧只有 prompt，补全 imagePrompt/videoPrompt
       const anyFrame = frame as any;
@@ -350,9 +352,7 @@ const buildCharacterAssetPrompt = (prefix: string, character: Character): string
     prefix,
     `角色：${character.name}`,
     aliasPart,
-    character.description,
     character.appearance,
-    character.personality
   ]
     .map(v => String(v ?? '').trim())
     .filter(Boolean);
@@ -376,6 +376,7 @@ const isXskillNanoBanana2Model = (model: string) => model === 'xskill-nano-banan
 const isJarvisNanoBanana2Model = (model: string) => model === 'jarvis-nano-banana-2';
 const isBltcyBanana2Model = (model: string) => model === 'bltcy-banana-2';
 const isBltcyNanoBananaHdModel = (model: string) => model === 'bltcy-nano-banana-hd';
+const isBltcyNanoBananaProModel = (model: string) => model === 'bltcy-nano-banana-pro';
 const isGrsaiChatModel = (model: string) => model.startsWith('grsai-');
 const getGrsaiChatModelName = (model: string) => model.replace(/^grsai-/, '');
 
@@ -900,6 +901,7 @@ const ProjectSettingsForm: React.FC<{
             <option value="jarvis-nano-banana-2">贾维斯中转nano banana2</option>
             <option value="bltcy-banana-2">柏拉图中转_banana2 (2K)</option>
             <option value="bltcy-nano-banana-hd">柏拉图中转_nano banana (HD)</option>
+            <option value="bltcy-nano-banana-pro">柏拉图中转_nano banana pro</option>
             <option value="doubao-seedream-4-5-251128">火山引擎 Seedream 4.5</option>
             <option value="gemini-2.5-flash-image">Gemini 2.5 Flash Image</option>
             <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image (高质量)</option>
@@ -920,6 +922,7 @@ const ProjectSettingsForm: React.FC<{
             <option value="jarvis-nano-banana-2">贾维斯中转nano banana2</option>
             <option value="bltcy-banana-2">柏拉图中转_banana2 (2K)</option>
             <option value="bltcy-nano-banana-hd">柏拉图中转_nano banana (HD)</option>
+            <option value="bltcy-nano-banana-pro">柏拉图中转_nano banana pro</option>
             <option value="doubao-seedream-4-5-251128">火山引擎 Seedream 4.5</option>
             <option value="gemini-2.5-flash-image">Gemini 2.5 Flash Image</option>
             <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image (高质量)</option>
@@ -935,10 +938,12 @@ const ProjectSettingsForm: React.FC<{
             className="w-full bg-gray-700 border border-gray-600 rounded p-2 text-white"
           >
             <option value="doubao-seedance-1-5-pro-251215">豆包 Seedance 1.5 Pro (推荐)</option>
+            <option value="kling-v3-omni">可灵 Kling v3 Omni</option>
             <option value="seedance-2.0-fast">速推 Seedance 2.0 (测试用)</option>
             <option value="sora-2.0">速推 Sora 2.0</option>
             <option value="bltcy-sora-2">柏拉图中转 Sora 2</option>
             <option value="bltcy-veo3">柏拉图中转 Veo 3.1</option>
+            <option value="bltcy-wan-2-6">柏拉图中转 Wan 2.6</option>
             <option value="veo-3.1-fast-generate-preview">Veo 3.1 Fast</option>
             <option value="veo-3.1-generate-preview">Veo 3.1 High Quality</option>
           </select>
@@ -1402,6 +1407,7 @@ const App: React.FC = () => {
   // When audio drives advancement (video+audio frames), video.onEnded must not also advance.
   const audioEndedHandlerRef = useRef<(() => void) | null>(null);
   const [selectedFrameIds, setSelectedFrameIds] = useState<string[]>([]); // Batch selection
+  const [useVideoPromptForImage, setUseVideoPromptForImage] = useState(false); // 用视频提示词生图
   const [draggedFrameIndex, setDraggedFrameIndex] = useState<number | null>(null); // For Drag & Drop
 
   // Asset Management State
@@ -1457,6 +1463,8 @@ const App: React.FC = () => {
   const [exportMessage, setExportMessage] = useState('');
   const [isExportingStoryboardZip, setIsExportingStoryboardZip] = useState(false);
   const [storyboardZipMessage, setStoryboardZipMessage] = useState('');
+  const [isExportingAssetZip, setIsExportingAssetZip] = useState(false);
+  const [assetZipMessage, setAssetZipMessage] = useState('');
 
   const [newProjectData, setNewProjectData] = useState<{name: string, type: ProjectType, settings: ProjectSettings}>({
     name: '',
@@ -1483,6 +1491,13 @@ const App: React.FC = () => {
   // Computed
   const currentProject = projects.find(p => p.id === currentProjectId);
   const currentEpisode = currentProject?.episodes.find(e => e.id === currentEpisodeId);
+  const hasAnyAssetImages = Boolean(
+    currentProject && (
+      (currentProject.characters || []).some(character => !!character.imageUrl) ||
+      (currentProject.variants || []).some(variant => !!variant.imageUrl) ||
+      (currentProject.scenes || []).some(scene => !!scene.imageUrl)
+    )
+  );
   const editingFrame = currentEpisode?.frames.find(f => f.id === editingFrameId);
   const previewFrame = currentEpisode?.frames.find(f => f.id === previewFrameId);
   const previewAssetItem = previewAsset
@@ -2443,7 +2458,7 @@ const App: React.FC = () => {
         frameIdsToProcess.forEach(frameId => {
           const frame = currentEpisode.frames.find(f => f.id === frameId);
           if (frame) {
-            handleGenerateFrameImage(frameId, frame.imagePrompt || "");
+            handleGenerateFrameImage(frameId, useVideoPromptForImage ? frame.videoPrompt : frame.imagePrompt);
           }
         });
       } else if (type === 'video') {
@@ -3010,6 +3025,17 @@ const App: React.FC = () => {
                           }));
                       }
                   );
+              } else if (isBltcyNanoBananaProModel(model)) {
+                  // 使用柏拉图中转 nano banana pro
+                  imageUrl = await generateImageWithBltcyNanoBananaPro(
+                      prompt, '16:9', charReferenceImages, projectId,
+                      (progress) => {
+                          setProjects(prev => prev.map(p => p.id !== projectId ? p : {
+                              ...p,
+                              variants: (p.variants ?? []).map(v => v.id === variantId ? { ...v, progress, error: undefined } : v)
+                          }));
+                      }
+                  );
               } else {
                   imageUrl = await generateImageAsset(prompt, '16:9', model);
               }
@@ -3057,11 +3083,20 @@ const App: React.FC = () => {
       scriptLength: currentEpisode.scriptContent.length
     });
 
-    setEpisodeProcessing(currentEpisode.id, true);
     try {
       // 1. Get Settings for this Project Type
       const prompts = globalSettings.projectTypePrompts[currentProject.type];
       const model = globalSettings.extractionModel;
+
+      if (model.startsWith('doubao')) {
+        const connectivity = await checkVolcengineConnectivity();
+        if (!connectivity.ok) {
+          alert(`豆包连通性检测失败：${connectivity.error}`);
+          return;
+        }
+      }
+
+      setEpisodeProcessing(currentEpisode.id, true);
 
       Logger.logInfo('使用的模型和提示词配置', {
         model,
@@ -3179,11 +3214,20 @@ const App: React.FC = () => {
       scriptLength: currentEpisode.scriptContent.length
     });
 
-    setEpisodeProcessing(currentEpisode.id, true);
     try {
       // 1. Get Settings for this Project Type
       const prompts = globalSettings.projectTypePrompts[currentProject.type];
       const model = globalSettings.extractionModel;
+
+      if (model.startsWith('doubao')) {
+        const connectivity = await checkVolcengineConnectivity();
+        if (!connectivity.ok) {
+          alert(`豆包连通性检测失败：${connectivity.error}`);
+          return;
+        }
+      }
+
+      setEpisodeProcessing(currentEpisode.id, true);
 
       Logger.logInfo('使用的模型和提示词配置', {
         model,
@@ -3294,11 +3338,20 @@ const App: React.FC = () => {
       scriptLength: currentEpisode.scriptContent.length
     });
 
-    setEpisodeProcessing(currentEpisode.id, true);
     try {
       // 1. Get Settings for this Project Type
       const prompts = globalSettings.projectTypePrompts[currentProject.type];
       const model = globalSettings.extractionModel;
+
+      if (model.startsWith('doubao')) {
+        const connectivity = await checkVolcengineConnectivity();
+        if (!connectivity.ok) {
+          alert(`豆包连通性检测失败：${connectivity.error}`);
+          return;
+        }
+      }
+
+      setEpisodeProcessing(currentEpisode.id, true);
 
       Logger.logInfo('使用的模型和提示词配置', {
         model,
@@ -3736,6 +3789,34 @@ const App: React.FC = () => {
               });
             }
           );
+        } else if (isBltcyNanoBananaProModel(model)) {
+          // 使用柏拉图中转 nano banana pro
+          imageUrl = await generateImageWithBltcyNanoBananaPro(
+            prompt,
+            '16:9',
+            [],
+            projectId,
+            (progress) => {
+              setProjects(prevProjects => {
+                const newProjects = [...prevProjects];
+                const projIndex = newProjects.findIndex(p => p.id === projectId);
+                if (projIndex === -1) return prevProjects;
+
+                const newProj = { ...newProjects[projIndex] };
+                if (type === 'character') {
+                  newProj.characters = newProj.characters.map(c =>
+                    c.id === id ? { ...c, progress, error: undefined } : c
+                  );
+                } else {
+                  newProj.scenes = newProj.scenes.map(s =>
+                    s.id === id ? { ...s, progress, error: undefined } : s
+                  );
+                }
+                newProjects[projIndex] = newProj;
+                return newProjects;
+              });
+            }
+          );
         } else {
           // 使用Gemini服务
           imageUrl = await generateImageAsset(prompt, '16:9', model);
@@ -4080,6 +4161,36 @@ const App: React.FC = () => {
               });
             }
           );
+        } else if (isBltcyNanoBananaProModel(model)) {
+          // 使用柏拉图中转 nano banana pro
+          imageUrl = await generateImageWithBltcyNanoBananaPro(
+            `${prefix}\n\n${prompt}`,
+            aspectRatio,
+            referenceImages,
+            projectId,
+            (progress) => {
+              setProjects(prevProjects => {
+                const newProjects = [...prevProjects];
+                const projIndex = newProjects.findIndex(p => p.id === projectId);
+                if (projIndex === -1) return prevProjects;
+
+                const newProj = { ...newProjects[projIndex] };
+                const epIndex = newProj.episodes.findIndex(e => e.id === episodeId);
+                if (epIndex === -1) return prevProjects;
+
+                newProj.episodes[epIndex].frames = newProj.episodes[epIndex].frames.map(f =>
+                  f.id === frameId ? {
+                    ...f,
+                    isGenerating: true,
+                    imageProgress: progress,
+                    imageError: undefined
+                  } : f
+                );
+                newProjects[projIndex] = newProj;
+                return newProjects;
+              });
+            }
+          );
         } else {
           // 使用Gemini服务
           imageUrl = await generateImageAsset(prompt, aspectRatio, model, referenceImages, prefix);
@@ -4282,6 +4393,10 @@ const App: React.FC = () => {
             multiRefImages.length > 0 ? multiRefImages : (capturedImageUrl ? [capturedImageUrl] : []),
             multiRefFullPrompt, aspectRatio, videoDuration, projectId, multiRefModel, onProgress
           );
+        } else if (model === 'kling-v3-omni') {
+          videoUrl = await generateVideoWithKlingOmni(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
+          );
         } else if (model.startsWith('doubao-seedance')) {
           try {
             videoUrl = await generateVideoWithVolcengine(
@@ -4315,6 +4430,10 @@ const App: React.FC = () => {
           );
         } else if (model === 'bltcy-veo3') {
           videoUrl = await generateVideoWithBltcyVeo3(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
+          );
+        } else if (model === 'bltcy-wan-2-6') {
+          videoUrl = await generateVideoWithBltcyWan26(
             capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
           );
         } else {
@@ -4497,6 +4616,40 @@ const App: React.FC = () => {
       setStoryboardZipMessage('');
     } finally {
       setIsExportingStoryboardZip(false);
+    }
+  };
+
+  const handleExportAssetZip = async () => {
+    if (!currentProject) {
+      alert('请先选择一个项目');
+      return;
+    }
+
+    if (!hasAnyAssetImages) {
+      alert('当前项目没有可导出的资产图');
+      return;
+    }
+
+    try {
+      setIsExportingAssetZip(true);
+      setAssetZipMessage('正在生成 ZIP...');
+
+      const result = await apiService.exportProjectAssetImagesZip(currentProject.id);
+      const downloadUrl = `${result.downloadUrl}?filename=${encodeURIComponent(result.filename)}`;
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = result.filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      setAssetZipMessage(`已导出 ${result.exportedCount} 张，跳过 ${result.skippedCount} 张`);
+    } catch (error) {
+      console.error('导出资产图 ZIP 失败:', error);
+      alert('导出资产图 ZIP 失败：' + (error as Error).message);
+      setAssetZipMessage('');
+    } finally {
+      setIsExportingAssetZip(false);
     }
   };
 
@@ -4755,6 +4908,7 @@ const App: React.FC = () => {
                                 <option value="nano-banana-2">grsai中转_nano-banana-2</option>
                                 <option value="bltcy-banana-2">柏拉图中转_banana2 (2K)</option>
                                 <option value="bltcy-nano-banana-hd">柏拉图中转_nano banana (HD)</option>
+            <option value="bltcy-nano-banana-pro">柏拉图中转_nano banana pro</option>
                                 <option value="doubao-seedream-4-5-251128">火山引擎 Seedream 4.5</option>
                                 <option value="gemini-2.5-flash-image">Gemini 2.5 Flash Image</option>
                                 <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image (高质量)</option>
@@ -4775,6 +4929,7 @@ const App: React.FC = () => {
                                 <option value="nano-banana-2">grsai中转_nano-banana-2</option>
                                 <option value="bltcy-banana-2">柏拉图中转_banana2 (2K)</option>
                                 <option value="bltcy-nano-banana-hd">柏拉图中转_nano banana (HD)</option>
+            <option value="bltcy-nano-banana-pro">柏拉图中转_nano banana pro</option>
                                 <option value="doubao-seedream-4-5-251128">火山引擎 Seedream 4.5</option>
                                 <option value="gemini-2.5-flash-image">Gemini 2.5 Flash Image</option>
                                 <option value="gemini-3-pro-image-preview">Gemini 3 Pro Image (高质量)</option>
@@ -4792,10 +4947,12 @@ const App: React.FC = () => {
                                 className="w-full bg-gray-900 border border-gray-600 rounded p-2 text-white text-sm"
                               >
                                 <option value="doubao-seedance-1-5-pro-251215">豆包 Seedance 1.5 Pro (推荐)</option>
+                                <option value="kling-v3-omni">可灵 Kling v3 Omni</option>
                                 <option value="seedance-2.0-fast">速推 Seedance 2.0 (测试用)</option>
                                 <option value="sora-2.0">速推 Sora 2.0</option>
                                 <option value="bltcy-sora-2">柏拉图中转 Sora 2</option>
                                 <option value="bltcy-veo3">柏拉图中转 Veo 3.1</option>
+            <option value="bltcy-wan-2-6">柏拉图中转 Wan 2.6</option>
                                 <option value="veo-3.1-fast-generate-preview">Veo 3.1 Fast</option>
                                 <option value="veo-3.1-generate-preview">Veo 3.1 High Quality</option>
                               </select>
@@ -5481,6 +5638,19 @@ const App: React.FC = () => {
                                 <Users size={12} />
                                 多参考生成 {currentProject.settings.multiRefVideoMode ? '开' : '关'}
                             </button>
+                            {/* 用视频提示词生图开关 */}
+                            <button
+                                onClick={() => setUseVideoPromptForImage(v => !v)}
+                                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border transition-all ${
+                                    useVideoPromptForImage
+                                    ? 'bg-amber-600/20 border-amber-500 text-amber-300'
+                                    : 'bg-gray-800 border-gray-600 text-gray-400 hover:border-gray-500'
+                                }`}
+                                title="开启后，生图时使用视频提示词而非生图提示词（前缀不变）"
+                            >
+                                <Film size={12} />
+                                视频词生图 {useVideoPromptForImage ? '开' : '关'}
+                            </button>
                         </div>
                         <div className="flex bg-gray-900 p-1 rounded-lg border border-gray-700">
                             <button 
@@ -5718,7 +5888,7 @@ const App: React.FC = () => {
                        {/* Quick Action Overlay */}
                        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover/image:opacity-100 transition-opacity flex items-center justify-center gap-2">
                           <button 
-                            onClick={() => handleGenerateFrameImage(frame.id, frame.imagePrompt)}
+                            onClick={() => handleGenerateFrameImage(frame.id, useVideoPromptForImage ? frame.videoPrompt : frame.imagePrompt)}
                             className="bg-blue-600 hover:bg-blue-500 text-white p-2 rounded-full shadow-lg flex items-center justify-center"
                             title="生成图片"
                           >
@@ -6062,7 +6232,7 @@ const App: React.FC = () => {
                 <Film className="w-16 h-16 text-blue-500 mx-auto mb-6" />
                 <h2 className="text-2xl font-bold mb-2">导出项目</h2>
                 <p className="text-gray-400 mb-8">
-                  导出当前分集的剪映工程或分镜图压缩包。
+                  导出当前分集的剪映工程、分镜图压缩包，或当前项目的资产图压缩包。
                 </p>
 
                 {isExporting ? (
@@ -6096,8 +6266,19 @@ const App: React.FC = () => {
                        {isExportingStoryboardZip ? <Loader2 className="animate-spin" size={18} /> : <Download size={18} />}
                        导出分镜图 ZIP
                      </button>
+                     <button
+                       onClick={handleExportAssetZip}
+                       disabled={isExportingAssetZip || !currentProject || !hasAnyAssetImages}
+                       className="w-full bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white py-3 rounded-lg font-medium flex items-center justify-center gap-2 transition-colors"
+                     >
+                       {isExportingAssetZip ? <Loader2 className="animate-spin" size={18} /> : <Download size={18} />}
+                       导出资产图 ZIP
+                     </button>
                      {storyboardZipMessage && (
                        <p className="text-sm text-gray-300">{storyboardZipMessage}</p>
+                     )}
+                     {assetZipMessage && (
+                       <p className="text-sm text-gray-300">{assetZipMessage}</p>
                      )}
                      {!globalSettings.jianyingExportPath && (
                        <p className="text-sm text-yellow-400 flex items-center justify-center gap-2">
@@ -6113,6 +6294,11 @@ const App: React.FC = () => {
                      {currentEpisode && !currentEpisode.frames.length && (
                        <p className="text-sm text-gray-500">
                          当前剧集没有分镜内容
+                       </p>
+                     )}
+                     {currentProject && !hasAnyAssetImages && (
+                       <p className="text-sm text-gray-500">
+                         当前项目没有可导出的资产图
                        </p>
                      )}
                   </div>
