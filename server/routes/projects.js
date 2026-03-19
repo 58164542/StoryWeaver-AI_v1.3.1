@@ -238,6 +238,36 @@ router.put('/:id/settings', async (req, res) => {
 });
 
 /**
+ * PUT /api/projects/:id/meta
+ * 只更新项目元数据（name / type），不触碰 episodes / characters / settings 等
+ */
+router.put('/:id/meta', async (req, res) => {
+  try {
+    const db = getDatabase();
+    const projectIndex = db.data.projects.findIndex(p => p.id === req.params.id);
+
+    if (projectIndex === -1) {
+      return res.status(404).json({ success: false, error: '项目不存在' });
+    }
+
+    const project = db.data.projects[projectIndex];
+    const { name, type } = req.body;
+
+    if (name !== undefined) project.name = name;
+    if (type !== undefined) project.type = type;
+    project.updatedAt = Date.now();
+
+    await saveDatabase();
+
+    console.log(`✅ 项目元数据已更新: ${project.name}`);
+    res.json({ success: true, data: project });
+  } catch (error) {
+    console.error('更新项目元数据失败:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
  * PUT /api/projects/:id/assets
  * 只更新项目资产（characters/scenes/variants）
  */
@@ -289,10 +319,17 @@ router.put('/:id/episodes/:episodeId', async (req, res) => {
       return res.status(404).json({ success: false, error: '分集不存在' });
     }
 
-    const updatedEpisode = req.body;
-    updatedEpisode.updatedAt = Date.now();
+    const existingEpisode = project.episodes[episodeIndex] || {};
+    const incomingEpisode = req.body && typeof req.body === 'object' ? req.body : {};
+    const updatedEpisode = {
+      ...existingEpisode,
+      ...incomingEpisode,
+      id: existingEpisode.id,
+      frames: Array.isArray(incomingEpisode.frames) ? incomingEpisode.frames : (existingEpisode.frames ?? []),
+      updatedAt: Date.now(),
+    };
 
-    // 只更新指定分集
+    // 只更新指定分集；如果请求体缺少 frames，则保留已有分镜
     project.episodes[episodeIndex] = updatedEpisode;
     project.updatedAt = Date.now();
 

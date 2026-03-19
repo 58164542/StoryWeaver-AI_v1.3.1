@@ -83,6 +83,7 @@ export const generateImageWithBltcyNanoBananaHd = async (
     prompt: fullPrompt,
     n: 1,
     response_format: "url",
+    imageSize: "2K",
   };
 
   // 参考图字段：按 OpenAI images 风格传 image[]

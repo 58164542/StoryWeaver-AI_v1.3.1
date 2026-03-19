@@ -24,14 +24,30 @@ async function request(url: string, options: RequestInit = {}) {
       },
     });
 
-    const data = await response.json();
+    const rawText = await response.text();
+    const contentType = response.headers.get('content-type') || '';
+    let data: any = null;
 
-    if (!response.ok) {
-      throw new Error(data.error || `HTTP ${response.status}: ${response.statusText}`);
+    if (rawText) {
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        const trimmed = rawText.trim();
+        const isHtmlResponse = contentType.includes('text/html') || /^<!DOCTYPE html>/i.test(trimmed) || /^<html[\s>]/i.test(trimmed);
+        if (isHtmlResponse) {
+          throw new Error(`接口返回了 HTML 而不是 JSON [${url}]。通常是后端未重启、API 路由不存在，或 VITE_API_URL 指到了前端服务。`);
+        }
+
+        throw new Error(`接口返回的不是合法 JSON [${url}]：${trimmed.slice(0, 200)}`);
+      }
     }
 
-    if (!data.success) {
-      throw new Error(data.error || '请求失败');
+    if (!response.ok) {
+      throw new Error(data?.error || `HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    if (!data?.success) {
+      throw new Error(data?.error || '请求失败');
     }
 
     return data.data;
@@ -74,6 +90,16 @@ export async function updateProject(projectId: string, project: any) {
   return request(`/api/projects/${projectId}`, {
     method: 'PUT',
     body: JSON.stringify(project),
+  });
+}
+
+/**
+ * 更新项目元数据（只更新 name / type，不触碰 episodes / characters / settings）
+ */
+export async function updateProjectMeta(projectId: string, meta: { name?: string; type?: string }) {
+  return request(`/api/projects/${projectId}/meta`, {
+    method: 'PUT',
+    body: JSON.stringify(meta),
   });
 }
 
@@ -164,6 +190,13 @@ export async function deleteProjectPermanently(projectId: string) {
  */
 export async function getSettings() {
   return request('/api/settings');
+}
+
+/**
+ * 实时读取分段 system prompt
+ */
+export async function getSegmentSkillPrompt() {
+  return request('/api/system-prompts/segment-skill');
 }
 
 /**
@@ -310,11 +343,13 @@ export default {
   getProject,
   createProject,
   updateProject,
+  updateProjectMeta,
   updateProjectSettings,
   updateProjectAssets,
   updateEpisode,
   deleteProject,
   getSettings,
+  getSegmentSkillPrompt,
   updateSettings,
   uploadMedia,
   saveExternalVideo,

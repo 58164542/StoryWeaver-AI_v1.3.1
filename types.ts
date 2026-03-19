@@ -130,6 +130,7 @@ export interface Episode {
   frames: StoryboardFrame[];
   updatedAt?: number;
   isProcessing?: boolean;  // 该分集是否正在处理（资产提取/分镜拆解等）
+  preprocessSegmentFailed?: boolean; // 小说预处理分段失败，当前 scriptContent 为回退原文
 }
 
 export interface Project {
@@ -175,7 +176,8 @@ export interface StoryboardBreakdownFrame {
   originalText: string;
   characterNames?: string[];
   variantNames?: string[];  // 变体资产名称，如 "东宫大婚·太子妃宫装"
-  sceneName?: string;
+  sceneName?: string;   // 旧字段，向后兼容
+  sceneNames?: string[]; // 新字段，支持多场景匹配
 }
 
 export interface StoryboardBreakdown {

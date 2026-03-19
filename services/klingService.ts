@@ -2,10 +2,9 @@ import { Logger } from "../utils/logger";
 import { uploadImageToGitHub, isBase64DataUrl } from "./githubImageService";
 import { readMediaAsBase64 } from "./apiService";
 
-const KLING_API_BASE = "https://api-beijing.klingai.com";
-const KLING_VIDEO_ENDPOINT = `${KLING_API_BASE}/v1/videos/omni-video`;
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
-type KlingStatus = "pending" | "processing" | "running" | "success" | "succeeded" | "completed" | "failed" | "error" | "cancelled" | "canceled";
+const KLING_PROXY_BASE = `${API_BASE_URL}/api/kling`;
 
 interface KlingCreateResponse {
   code?: number;
@@ -23,21 +22,15 @@ interface KlingCreateResponse {
 interface KlingQueryResponse {
   code?: number;
   message?: string;
+  request_id?: string;
   data?: {
-    status?: KlingStatus | string;
-    result?: any;
-    output?: any;
-    error?: any;
-    videos?: any[];
-    video_url?: string;
-    message?: string;
+    task_id?: string;
+    task_status?: string;
+    task_status_msg?: string;
+    task_result?: {
+      videos?: Array<{ id?: string; url?: string; watermark_url?: string; duration?: string }>;
+    };
   };
-  status?: KlingStatus | string;
-  result?: any;
-  output?: any;
-  error?: any;
-  videos?: any[];
-  video_url?: string;
 }
 
 const normalizeImageUrlInput = (value: string): string => {
@@ -78,36 +71,6 @@ const isPublicHttpUrl = (value: string): boolean => {
   return true;
 };
 
-const base64UrlEncode = (data: Uint8Array): string => {
-  let binary = "";
-  for (let i = 0; i < data.length; i++) {
-    binary += String.fromCharCode(data[i]);
-  }
-  const base64 = btoa(binary);
-  return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-};
-
-const base64UrlEncodeString = (text: string): string => {
-  const encoded = new TextEncoder().encode(text);
-  return base64UrlEncode(encoded);
-};
-
-const signHmacSha256 = async (data: string, secret: string): Promise<string> => {
-  const subtle = (globalThis.crypto as Crypto | undefined)?.subtle;
-  if (!subtle) {
-    throw new Error("当前环境不支持加密签名，无法生成可灵 API Token");
-  }
-  const key = await subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const signature = await subtle.sign("HMAC", key, new TextEncoder().encode(data));
-  return base64UrlEncode(new Uint8Array(signature));
-};
-
 const getKlingApiToken = async (): Promise<string> => {
   const directToken = process.env.KLING_API_TOKEN || process.env.KLING_API_KEY;
   if (directToken) return directToken;
@@ -118,14 +81,20 @@ const getKlingApiToken = async (): Promise<string> => {
     throw new Error("请在 .env.local 文件中配置 KLING_API_TOKEN 或 KLING_ACCESS_KEY / KLING_SECRET_KEY");
   }
 
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: "HS256", typ: "JWT" };
-  const payload = { iss: accessKey, exp: now + 1800, nbf: now - 5 };
-  const encodedHeader = base64UrlEncodeString(JSON.stringify(header));
-  const encodedPayload = base64UrlEncodeString(JSON.stringify(payload));
-  const signingInput = `${encodedHeader}.${encodedPayload}`;
-  const signature = await signHmacSha256(signingInput, secretKey);
-  return `${signingInput}.${signature}`;
+  // 通过后端签名，避免 Web Crypto API 在非 HTTPS 局域网环境下不可用
+  const response = await fetch(`${API_BASE_URL}/api/kling/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`获取可灵 Token 失败 (${response.status}): ${err}`);
+  }
+  const result = await response.json();
+  if (!result.success || !result.data?.token) {
+    throw new Error(result.error || '后端返回可灵 Token 为空');
+  }
+  return result.data.token;
 };
 
 const extractTaskId = (data: KlingCreateResponse): string | null => {
@@ -133,32 +102,15 @@ const extractTaskId = (data: KlingCreateResponse): string | null => {
 };
 
 const extractStatus = (data: KlingQueryResponse): string | undefined => {
-  return data.data?.status || data.status;
+  return data.data?.task_status;
 };
 
 const extractVideoUrl = (data: KlingQueryResponse): string | null => {
-  const scope = data.data ?? data;
-  return (
-    scope?.result?.video_url ||
-    scope?.result?.videos?.[0]?.url ||
-    scope?.result?.videos?.[0]?.video_url ||
-    scope?.result?.output?.videos?.[0]?.url ||
-    scope?.result?.output?.videos?.[0]?.video_url ||
-    scope?.output?.video_url ||
-    scope?.videos?.[0]?.url ||
-    scope?.videos?.[0]?.video_url ||
-    scope?.video_url ||
-    null
-  );
+  return data.data?.task_result?.videos?.[0]?.url ?? null;
 };
 
 const extractErrorMessage = (data: KlingQueryResponse): string | undefined => {
-  const scope = data.data ?? data;
-  if (!scope) return undefined;
-  if (typeof scope.error === "string") return scope.error;
-  if (scope.error?.message) return scope.error.message;
-  if (typeof scope.message === "string") return scope.message;
-  return undefined;
+  return data.data?.task_status_msg || data.message;
 };
 
 const resolveKlingImageUrl = async (
@@ -188,16 +140,15 @@ export const generateVideoWithKlingOmni = async (
   onProgress?: (progress: number) => void,
   githubImageUrl?: string
 ): Promise<string> => {
-  const apiToken = await getKlingApiToken();
   const finalImageUrl = await resolveKlingImageUrl(imageUrl, projectId, githubImageUrl);
 
   const createPayload: any = {
-    model: "kling-v3-omni",
+    model_name: "kling-v3-omni",
     prompt,
     multi_shot: false,
     aspect_ratio: aspectRatio,
-    duration,
-    sound: "off",
+    duration: String(duration),
+    sound: "on",
     image_list: finalImageUrl ? [{ image_url: finalImageUrl }] : undefined
   };
 
@@ -205,12 +156,11 @@ export const generateVideoWithKlingOmni = async (
     delete createPayload.image_list;
   }
 
-  Logger.logRequest("Kling Omni", "createTask", KLING_VIDEO_ENDPOINT, createPayload);
+  Logger.logRequest("Kling Omni", "createTask", `${KLING_PROXY_BASE}/videos`, createPayload);
 
-  const createResponse = await fetch(KLING_VIDEO_ENDPOINT, {
+  const createResponse = await fetch(`${KLING_PROXY_BASE}/videos`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiToken}`,
       "Content-Type": "application/json"
     },
     body: JSON.stringify(createPayload)
@@ -234,21 +184,20 @@ export const generateVideoWithKlingOmni = async (
 
   Logger.logInfo("Kling Omni 视频生成任务已创建", { taskId });
 
-  const maxAttempts = 180;
+  const maxAttempts = 360;
   const pollInterval = 5000;
   let attempts = 0;
 
-  const successStatuses = new Set(["success", "succeeded", "completed", "finished", "done"]);
-  const failedStatuses = new Set(["failed", "error", "cancelled", "canceled"]);
+  const successStatuses = new Set(["succeed", "success", "succeeded", "completed"]);
+  const failedStatuses = new Set(["failed", "fail", "error", "cancelled", "canceled"]);
 
   while (attempts < maxAttempts) {
     await new Promise(resolve => setTimeout(resolve, pollInterval));
     attempts++;
 
-    const queryResponse = await fetch(`${KLING_VIDEO_ENDPOINT}/${taskId}`, {
+    const queryResponse = await fetch(`${KLING_PROXY_BASE}/videos/${taskId}`, {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${apiToken}`,
         "Content-Type": "application/json"
       }
     });
@@ -267,8 +216,8 @@ export const generateVideoWithKlingOmni = async (
 
     if (onProgress) {
       let progress = 0;
-      if (status === "pending") progress = 10;
-      else if (status === "processing" || status === "running") progress = Math.min(10 + (attempts / maxAttempts) * 80, 90);
+      if (status === "submitted") progress = 10;
+      else if (status === "processing") progress = Math.min(10 + (attempts / maxAttempts) * 80, 90);
       else if (status && successStatuses.has(status)) progress = 100;
       onProgress(progress);
     }

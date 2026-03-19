@@ -234,27 +234,39 @@ router.post('/read-as-base64', async (req, res) => {
       return res.status(400).json({ success: false, error: '缺少 url 参数' });
     }
 
-    // 从 URL 解析 type 和 filename
-    const match = String(url).match(/\/api\/media\/(images|videos|audio)\/([^?#]+)/);
-    if (!match) {
-      return res.status(400).json({ success: false, error: '无效的媒体 URL，无法解析 type/filename' });
-    }
-    const [, type, filename] = match;
-    const filePath = getMediaPath(type, filename);
+    const normalizedUrl = String(url).trim();
+    let buffer;
+    let mimeType = 'image/jpeg';
 
-    // 检查文件是否存在
-    try {
-      await fs.access(filePath);
-    } catch {
-      return res.status(404).json({ success: false, error: '文件不存在' });
+    // 本地媒体文件
+    const match = normalizedUrl.match(/\/api\/media\/(images|videos|audio)\/([^?#]+)/);
+    if (match) {
+      const [, type, filename] = match;
+      const filePath = getMediaPath(type, filename);
+
+      try {
+        await fs.access(filePath);
+      } catch {
+        return res.status(404).json({ success: false, error: '文件不存在' });
+      }
+
+      buffer = await fs.readFile(filePath);
+      const ext = filename.split('.').pop()?.toLowerCase() || '';
+      const mimeMap = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav' };
+      mimeType = mimeMap[ext] || 'image/jpeg';
+    } else if (/^https?:\/\//i.test(normalizedUrl)) {
+      const response = await fetch(normalizedUrl);
+      if (!response.ok) {
+        return res.status(response.status).json({ success: false, error: `远程文件读取失败 (${response.status})` });
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      buffer = Buffer.from(arrayBuffer);
+      mimeType = (response.headers.get('content-type') || '').split(';')[0].trim() || 'image/jpeg';
+    } else {
+      return res.status(400).json({ success: false, error: '无效的媒体 URL，仅支持本地媒体 URL 或公网 http/https URL' });
     }
 
-    const buffer = await fs.readFile(filePath);
-    const ext = filename.split('.').pop()?.toLowerCase() || '';
-    const mimeMap = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
-    const mimeType = mimeMap[ext] || 'image/jpeg';
     const base64Data = `data:${mimeType};base64,${buffer.toString('base64')}`;
-
     res.json({ success: true, data: { base64Data } });
   } catch (error) {
     console.error('读取媒体文件为 base64 失败:', error);

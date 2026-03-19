@@ -9,7 +9,7 @@ import { analyzeNovelScript as analyzeNovelScriptVolcengine, analyzeNovelScriptW
 import { generateVideoWithSeedance, generateVideoWithSeedanceMultiRef } from './services/seedanceService';
 import { generateVideoWithSora } from './services/soraService';
 import { generateVideoWithKlingOmni } from './services/klingService';
-import { generateVideoWithBltcySora, generateVideoWithBltcyVeo3, generateVideoWithBltcyWan26 } from './services/bltcySoraService';
+import { generateVideoWithBltcySora, generateVideoWithBltcyVeo3, generateVideoWithBltcyWan26, generateVideoWithBltcyGrokVideo3 } from './services/bltcySoraService';
 import { generateImageWithBananaPro } from './services/bananaProService';
 import { generateImageWithVolcengine } from './services/volcengineImageService';
 import { generateImageWithXskillNanoBanana2 } from './services/xskillImageService';
@@ -19,6 +19,11 @@ import { generateImageWithBltcyNanoBananaHd, generateImageWithBltcyNanoBananaPro
 import { exportToJianying } from './services/jianyingService';
 import { Logger } from './utils/logger';
 import { taskQueue } from './utils/taskQueue';
+import { splitNovelIntoEpisodes, detectEpisodeTitles } from './utils/novelSplitter';
+import { analyzeNovelScriptWithClaude, segmentEpisodeWithClaude } from './services/claudeService';
+import { createDuplicatedProject } from './utils/projectDuplication.js';
+import { PREPROCESS_SEGMENT_CONCURRENCY, mapWithConcurrencyLimit } from './utils/segmentConcurrency.js';
+import { buildEpisodeFromPreprocessResult, getFailedPreprocessEpisodes } from './utils/preprocessSegmentation.js';
 import { generateFrameAudioWithMinimax } from './services/ttsService';
 import { Loader2, Plus, Trash2, Save, Wand2, Image as ImageIcon, Play, Pause, SkipBack, SkipForward, Download, Users, Film, ArrowLeft, FileText, Clock, Settings, X, Link, Edit2, Check, LayoutGrid, Clapperboard, ChevronRight, ChevronLeft, Globe, Copy, CheckSquare, Square, GripVertical, MoreHorizontal, Volume2, Mic, AlertCircle, RefreshCw, Eye, Upload } from 'lucide-react';
 import * as apiService from './services/apiService';
@@ -110,8 +115,13 @@ const migrateImageModel = (model?: string) => {
   return model ?? DEFAULT_SETTINGS.imageModel;
 };
 
+const resolveProjectId = (project: Project & { projectId?: string; _id?: string }) => {
+  return project.id ?? project.projectId ?? project._id ?? '';
+};
+
 const normalizeProject = (project: Project): Project => ({
   ...project,
+  id: resolveProjectId(project as Project & { projectId?: string; _id?: string }),
   // 重置 character/variant/scene 的生成中间状态，防止刷新后按钮永久卡死
   characters: (project.characters ?? []).map(c => ({ ...c, progress: undefined, error: undefined })),
   variants: (project.variants ?? []).map(v => ({ ...v, progress: undefined, error: undefined })),
@@ -944,6 +954,7 @@ const ProjectSettingsForm: React.FC<{
             <option value="bltcy-sora-2">柏拉图中转 Sora 2</option>
             <option value="bltcy-veo3">柏拉图中转 Veo 3.1</option>
             <option value="bltcy-wan-2-6">柏拉图中转 Wan 2.6</option>
+            <option value="bltcy-grok-video-3">柏拉图中转 grok-video-3</option>
             <option value="veo-3.1-fast-generate-preview">Veo 3.1 Fast</option>
             <option value="veo-3.1-generate-preview">Veo 3.1 High Quality</option>
           </select>
@@ -1381,9 +1392,8 @@ const App: React.FC = () => {
   const [viewMode, setViewMode] = useState<ViewMode>(ViewMode.PROJECT_LIST);
   const [projects, setProjects] = useState<Project[]>([]);
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
-  // 已保存快照：null 表示初始化未完成（防止初始加载时触发保存）
-  const savedProjectsRef = useRef<Map<string, number> | null>(null);
   const [currentEpisodeId, setCurrentEpisodeId] = useState<string | null>(null);
+  const [selectedEpisodeIds, setSelectedEpisodeIds] = useState<Set<string>>(new Set());
   const [activeTab, setActiveTab] = useState<string>(ProjectTab.SCRIPT);
 
   // 资产和分集的保存快照（用于细粒度保存）
@@ -1431,6 +1441,11 @@ const App: React.FC = () => {
   const [previewFrameId, setPreviewFrameId] = useState<string | null>(null);
   const [previewFrameMode, setPreviewFrameMode] = useState<'image' | 'video'>('image');
   const [previewAsset, setPreviewAsset] = useState<{ type: 'character' | 'scene'; id: string } | null>(null);
+
+  // 小说预处理 Modal
+  const [showNovelPreprocessModal, setShowNovelPreprocessModal] = useState(false);
+  const [preprocessNovelText, setPreprocessNovelText] = useState('');
+  const [isPreprocessing, setIsPreprocessing] = useState(false);
 
   // Auto-rewrite + retry guard (avoid infinite loops)
   const autoRewriteRetryRef = useRef<Set<string>>(new Set());
@@ -1491,6 +1506,7 @@ const App: React.FC = () => {
   // Computed
   const currentProject = projects.find(p => p.id === currentProjectId);
   const currentEpisode = currentProject?.episodes.find(e => e.id === currentEpisodeId);
+  const failedPreprocessEpisodes = getFailedPreprocessEpisodes(currentProject?.episodes ?? []);
   const hasAnyAssetImages = Boolean(
     currentProject && (
       (currentProject.characters || []).some(character => !!character.imageUrl) ||
@@ -1526,8 +1542,6 @@ const App: React.FC = () => {
         try {
           const loadedProjects = await apiService.getAllProjects();
           const normalizedProjects = normalizeProjects(loadedProjects);
-          // 先写入快照，再 setProjects，防止自动保存 useEffect 将初始加载视为本地修改
-          savedProjectsRef.current = new Map(normalizedProjects.map(p => [p.id, p.updatedAt]));
 
           // 初始化资产和分集快照
           savedAssetsRef.current = new Map(normalizedProjects.map(p => [
@@ -1553,7 +1567,6 @@ const App: React.FC = () => {
                 if (changed) {
                   migrated.updatedAt = Date.now();
                   await apiService.updateProject(migrated.id, migrated);
-                  savedProjectsRef.current.set(migrated.id, migrated.updatedAt);
                   setProjects(prev => prev.map(p => p.id === migrated.id ? migrated : p));
                   migratedCount++;
                 }
@@ -1659,49 +1672,6 @@ const App: React.FC = () => {
 
     initializeApp();
   }, []);
-
-  useEffect(() => {
-    // 自动保存项目到后端（仅保存本地修改的项目，避免多主机互相覆盖）
-    // savedProjectsRef.current 为 null 时表示初始化未完成，跳过保存
-    if (savedProjectsRef.current === null) return;
-    if (projects.length === 0) return;
-
-    // 找出本地修改的项目（updatedAt 发生变化，或是新增的项目）
-    const dirtyProjects = projects.filter(project => {
-      const savedAt = savedProjectsRef.current!.get(project.id);
-      return savedAt === undefined || savedAt !== project.updatedAt;
-    });
-
-    if (dirtyProjects.length === 0) return;
-
-    const saveProjects = async () => {
-      try {
-        let savedCount = 0;
-        for (const project of dirtyProjects) {
-          try {
-            await apiService.updateProject(project.id, project);
-            // 保存成功后更新快照，防止重复保存
-            savedProjectsRef.current!.set(project.id, project.updatedAt);
-            savedCount++;
-          } catch (error) {
-            console.error(`保存项目 ${project.name} 失败:`, error);
-          }
-        }
-        if (savedCount > 0) {
-          console.log(`✅ 已自动保存 ${savedCount} 个修改的项目`);
-        }
-        if (savedCount < dirtyProjects.length) {
-          console.error(`❌ ${dirtyProjects.length - savedCount} 个项目保存失败，请检查控制台错误`);
-        }
-      } catch (error) {
-        console.error('自动保存失败:', error);
-      }
-    };
-
-    // 使用防抖，避免频繁保存
-    const timeoutId = setTimeout(saveProjects, 500);
-    return () => clearTimeout(timeoutId);
-  }, [projects]);
 
   useEffect(() => {
     // 自动保存资产到后端（只在资产修改后保存）
@@ -1897,15 +1867,17 @@ const App: React.FC = () => {
   };
 
   const handleOpenProject = async (projectId: string) => {
+    if (!projectId) {
+      alert('该项目缺少 ID，请重启后端让旧项目数据自动迁移后再试。');
+      return;
+    }
+
     setIsOpeningProject(true);
     setOpeningProjectId(projectId);
 
     try {
       const latest = await apiService.getProject(projectId);
       const normalized = normalizeProject(latest);
-
-      // 同步快照：避免把”打开时拉取的最新数据”当成本地修改触发反向覆盖
-      savedProjectsRef.current?.set(normalized.id, normalized.updatedAt);
 
       // 同步资产快照
       savedAssetsRef.current?.set(
@@ -1967,12 +1939,14 @@ const App: React.FC = () => {
   };
 
   const handleOpenProjectSettingsModal = async (projectId: string) => {
+    if (!projectId) {
+      alert('该项目缺少 ID，请重启后端让旧项目数据自动迁移后再试。');
+      return;
+    }
+
     try {
       const latest = await apiService.getProject(projectId);
       const normalized = normalizeProject(latest);
-
-      // 同步快照：避免把“打开设置时拉取的最新数据”当成本地修改触发反向覆盖
-      savedProjectsRef.current?.set(normalized.id, normalized.updatedAt);
 
       // 用最新版本覆盖本地缓存
       setProjects(prev => prev.map(p => p.id === normalized.id ? normalized : p));
@@ -2023,8 +1997,6 @@ const App: React.FC = () => {
     try {
       // 调用后端API创建项目
       await apiService.createProject(newProject);
-      // 同步快照，防止 useEffect 将新项目视为脏数据再次调用 updateProject
-      savedProjectsRef.current?.set(newProject.id, newProject.updatedAt);
 
       // 初始化资产快照
       savedAssetsRef.current?.set(
@@ -2043,6 +2015,36 @@ const App: React.FC = () => {
     }
   };
 
+  const handleDuplicateProject = async (e: React.MouseEvent, projectId: string) => {
+    e.stopPropagation();
+    const sourceProject = projects.find(p => p.id === projectId);
+    if (!sourceProject) return;
+
+    const duplicatedProject = createDuplicatedProject(sourceProject);
+
+    try {
+      await apiService.createProject(duplicatedProject);
+
+      savedAssetsRef.current?.set(
+        duplicatedProject.id,
+        JSON.stringify({
+          characters: duplicatedProject.characters,
+          scenes: duplicatedProject.scenes,
+          variants: duplicatedProject.variants,
+        })
+      );
+      duplicatedProject.episodes.forEach(episode => {
+        savedEpisodesRef.current?.set(episode.id, episode.updatedAt);
+      });
+
+      setProjects(prev => [duplicatedProject, ...prev]);
+      console.log(`✅ 项目 "${duplicatedProject.name}" 复制成功`);
+    } catch (error) {
+      console.error('复制项目失败:', error);
+      alert('复制项目失败：' + (error as Error).message);
+    }
+  };
+
   const handleDeleteProject = async (e: React.MouseEvent, projectId: string) => {
     e.stopPropagation();
     const project = projects.find(p => p.id === projectId);
@@ -2053,6 +2055,7 @@ const App: React.FC = () => {
       setProjects(prev => prev.filter(p => p.id !== projectId));
       if (currentProjectId === projectId) {
         setCurrentProjectId(null);
+        setSelectedEpisodeIds(new Set());
         setViewMode(ViewMode.PROJECT_LIST);
       }
     } catch (error) {
@@ -2078,8 +2081,6 @@ const App: React.FC = () => {
   const handleRestoreProject = async (projectId: string) => {
     try {
       const restored = await apiService.restoreProject(projectId);
-      // 同步快照，防止 useEffect 将恢复的项目视为脏数据再次调用 updateProject
-      savedProjectsRef.current?.set(restored.id, restored.updatedAt);
 
       // 初始化资产和分集快照
       savedAssetsRef.current?.set(
@@ -2133,7 +2134,6 @@ const App: React.FC = () => {
             }
             // 覆盖现有项目（更新后端）
             await apiService.updateProject(normalizedProject.id, normalizedProject);
-            savedProjectsRef.current?.set(normalizedProject.id, normalizedProject.updatedAt);
 
             // 同步资产和分集快照
             savedAssetsRef.current?.set(
@@ -2148,7 +2148,6 @@ const App: React.FC = () => {
           } else {
             // 添加新项目（创建到后端）
             await apiService.createProject(normalizedProject);
-            savedProjectsRef.current?.set(normalizedProject.id, normalizedProject.updatedAt);
 
             // 初始化资产和分集快照
             savedAssetsRef.current?.set(
@@ -2216,7 +2215,7 @@ const App: React.FC = () => {
     }
   };
 
-  const handleCreateEpisode = () => {
+  const handleCreateEpisode = async () => {
     if (!currentProject) return;
     const newEpisode: Episode = {
       id: uuidv4(),
@@ -2226,15 +2225,161 @@ const App: React.FC = () => {
       updatedAt: Date.now()
     };
 
-    // 直接修改 episodes 数组，不触发项目级保存
+    const updatedProject = {
+      ...currentProject,
+      episodes: [...currentProject.episodes, newEpisode],
+      updatedAt: Date.now()
+    };
+
     setProjects(prev => prev.map(p =>
       p.id === currentProject.id
-        ? { ...p, episodes: [...p.episodes, newEpisode] }
+        ? updatedProject
         : p
     ));
 
-    // 初始化新分集的保存快照
-    savedEpisodesRef.current?.set(newEpisode.id, newEpisode.updatedAt);
+    try {
+      await apiService.updateProject(currentProject.id, updatedProject);
+      savedEpisodesRef.current?.set(newEpisode.id, newEpisode.updatedAt);
+    } catch (error) {
+      console.error('创建分集失败:', error);
+      alert('创建分集失败：' + (error as Error).message);
+      setProjects(prev => prev.map(p => p.id === currentProject.id ? currentProject : p));
+    }
+  };
+
+  const handleNovelPreprocess = async () => {
+    if (!currentProject || !preprocessNovelText.trim()) return;
+
+    const episodeDrafts = splitNovelIntoEpisodes(preprocessNovelText);
+    if (episodeDrafts.length === 0) {
+      alert('未检测到章节标记，请确认文本中包含纯数字、中文数字，或“第X章/集/回/话”等章节标题');
+      return;
+    }
+
+    setIsPreprocessing(true);
+    try {
+      const prompts = globalSettings.projectTypePrompts[currentProject.type];
+      const systemInstruction = `${prompts.characterExtraction}\n\n${prompts.sceneExtraction}`;
+
+      // 截取前 8000 字用于资产提取
+      const textForAssets = preprocessNovelText.slice(0, 8000);
+      const { content: latestDirectorSkillPrompt } = await apiService.getSegmentSkillPrompt();
+
+      // 每章分段限流为 5 并发
+      const runSegmentTasksWithLimit = async () => mapWithConcurrencyLimit(
+        episodeDrafts,
+        PREPROCESS_SEGMENT_CONCURRENCY,
+        draft => segmentEpisodeWithClaude(draft.content, latestDirectorSkillPrompt, draft.title, {
+          fullNovelText: preprocessNovelText,
+        })
+      );
+
+      // 先执行全文资产提取，再执行每章分段（5 并发）
+      const analysis = await analyzeNovelScriptWithClaude(textForAssets, systemInstruction);
+      const segmentedScripts = await runSegmentTasksWithLimit();
+
+      // 构建新分集（scriptContent 替换为分段结果）
+      const now = Date.now();
+      const newEpisodes: Episode[] = episodeDrafts.map((draft, i) => buildEpisodeFromPreprocessResult({
+        id: uuidv4(),
+        name: draft.title,
+        scriptContent: draft.content,
+        frames: [],
+        updatedAt: now + i,
+      }, segmentedScripts[i]));
+
+      // 构建新资产（按名称去重追加）
+      const existingCharNames = new Set(currentProject.characters.map(c => c.name));
+      const existingSceneNames = new Set(currentProject.scenes.map(s => s.name));
+
+      const newCharacters: Character[] = analysis.characters
+        .filter(c => !existingCharNames.has(c.name))
+        .map(c => {
+          const normalized = normalizeCharacterInput(c.name, c.aliases);
+          return { ...c, ...normalized, id: uuidv4(), aliases: normalized.aliases };
+        });
+
+      const newScenes: Scene[] = analysis.scenes
+        .filter(s => !existingSceneNames.has(s.name))
+        .map(s => ({ ...s, id: uuidv4() }));
+
+      const allCharacters = [...currentProject.characters, ...newCharacters];
+      const existingVariantKeys = new Set(
+        (currentProject.variants ?? []).map(v => `${v.characterId}::${v.name}`)
+      );
+      const newVariants: CharacterVariant[] = (analysis.variants ?? [])
+        .map(v => {
+          const char = allCharacters.find(
+            c => c.name === v.characterName || (c.aliases ?? []).includes(v.characterName)
+          );
+          if (!char) return null;
+          const key = `${char.id}::${v.name}`;
+          if (existingVariantKeys.has(key)) return null;
+          return { id: uuidv4(), characterId: char.id, name: v.name, context: v.context, appearance: v.appearance } as CharacterVariant;
+        })
+        .filter((v): v is CharacterVariant => v !== null);
+
+      const updatedProject = {
+        ...currentProject,
+        episodes: [...currentProject.episodes, ...newEpisodes],
+        characters: [...currentProject.characters, ...newCharacters],
+        scenes: [...currentProject.scenes, ...newScenes],
+        variants: [...(currentProject.variants ?? []), ...newVariants],
+        updatedAt: Date.now(),
+      };
+
+      setProjects(prev => prev.map(p => p.id === currentProject.id ? updatedProject : p));
+
+      await apiService.updateProject(currentProject.id, updatedProject);
+      newEpisodes.forEach(e => savedEpisodesRef.current?.set(e.id, e.updatedAt));
+
+      setShowNovelPreprocessModal(false);
+      setPreprocessNovelText('');
+    } catch (error) {
+      console.error('小说预处理失败:', error);
+      alert('预处理失败：' + (error as Error).message);
+    } finally {
+      setIsPreprocessing(false);
+    }
+  };
+
+  const handleRetryFailedPreprocessEpisodes = async () => {
+    if (!currentProject || failedPreprocessEpisodes.length === 0 || isPreprocessing) return;
+
+    setIsPreprocessing(true);
+    try {
+      const { content: latestDirectorSkillPrompt } = await apiService.getSegmentSkillPrompt();
+      const retryResults = await mapWithConcurrencyLimit(
+        failedPreprocessEpisodes,
+        PREPROCESS_SEGMENT_CONCURRENCY,
+        episode => segmentEpisodeWithClaude(episode.scriptContent, latestDirectorSkillPrompt, episode.name, {
+          fullNovelText: preprocessNovelText || undefined,
+        })
+      );
+
+      const retryResultMap = new Map(failedPreprocessEpisodes.map((episode, index) => [episode.id, retryResults[index]]));
+      const updatedProject = {
+        ...currentProject,
+        episodes: currentProject.episodes.map(episode => {
+          const retryResult = retryResultMap.get(episode.id);
+          if (!retryResult) return episode;
+          return buildEpisodeFromPreprocessResult({
+            ...episode,
+            updatedAt: Date.now(),
+          }, retryResult);
+        }),
+        updatedAt: Date.now(),
+      };
+
+      setProjects(prev => prev.map(p => p.id === currentProject.id ? updatedProject : p));
+      await apiService.updateProject(currentProject.id, updatedProject);
+      updatedProject.episodes.forEach(episode => savedEpisodesRef.current?.set(episode.id, episode.updatedAt));
+    } catch (error) {
+      console.error('重试预处理失败分集失败:', error);
+      alert('重试失败：' + (error as Error).message);
+    } finally {
+      setIsPreprocessing(false);
+    }
   };
 
   const handleDeleteEpisode = (e: React.MouseEvent, episodeId: string) => {
@@ -2253,6 +2398,18 @@ const App: React.FC = () => {
     }
   };
 
+  const handleDeleteSelectedEpisodes = () => {
+    if (!currentProject || selectedEpisodeIds.size === 0) return;
+    if (!confirm(`确定要删除选中的 ${selectedEpisodeIds.size} 个分集吗？`)) return;
+    setProjects(prev => prev.map(p =>
+      p.id === currentProject.id
+        ? { ...p, episodes: p.episodes.filter(ep => !selectedEpisodeIds.has(ep.id)) }
+        : p
+    ));
+    selectedEpisodeIds.forEach(id => savedEpisodesRef.current?.delete(id));
+    setSelectedEpisodeIds(new Set());
+  };
+
   const handleRenameEpisode = (e: React.MouseEvent, episodeId: string) => {
     e.stopPropagation();
     if (!currentProject) return;
@@ -2261,6 +2418,15 @@ const App: React.FC = () => {
     const nextName = prompt("重命名分集", episode.name)?.trim();
     if (!nextName || nextName === episode.name) return;
     handleUpdateEpisode(currentProject.id, episodeId, { name: nextName });
+  };
+
+  const handleRenameProject = (e: React.MouseEvent, projectId: string) => {
+    e.stopPropagation();
+    const project = projects.find(p => p.id === projectId);
+    if (!project) return;
+    const nextName = prompt("重命名项目", project.name)?.trim();
+    if (!nextName || nextName === project.name) return;
+    handleUpdateProject(projectId, { name: nextName });
   };
 
   const handleDuplicateEpisode = async (e: React.MouseEvent, episodeId: string) => {
@@ -2314,6 +2480,22 @@ const App: React.FC = () => {
 
   const handleUpdateProject = (projectId: string, updates: Partial<Project>) => {
     setProjects(prev => prev.map(p => p.id === projectId ? { ...p, ...updates, updatedAt: Date.now() } : p));
+
+    // 按 updates 内容路由到对应的细粒度 API，避免整体保存
+    if ('name' in updates || 'type' in updates) {
+      const meta: { name?: string; type?: string } = {};
+      if (updates.name !== undefined) meta.name = updates.name;
+      if (updates.type !== undefined) meta.type = updates.type;
+      if (Object.keys(meta).length > 0) {
+        apiService.updateProjectMeta(projectId, meta).catch(e => console.error('项目元数据保存失败:', e));
+      }
+    }
+
+    if ('settings' in updates && updates.settings !== undefined) {
+      apiService.updateProjectSettings(projectId, updates.settings).catch(e => console.error('项目设置保存失败:', e));
+    }
+
+    // characters / scenes / variants 的变化由资产 useEffect（500ms 防抖）自动处理
   };
 
   const handleUpdateEpisode = (projectId: string, episodeId: string, updates: Partial<Episode>) => {
@@ -3483,8 +3665,8 @@ const App: React.FC = () => {
 - 若该帧无可匹配角色：请输出 characterNames: [] 或直接省略 characterNames 字段
 
 2) 场景匹配规则：
-- frame.sceneName 必须只填写候选场景的 name（禁止输出自造场景名）
-- 若该帧无可匹配场景：请直接省略 sceneName 字段（不要输出空字符串）
+- frame.sceneNames 填写候选场景的 name 列表（可匹配多个场景，禁止输出自造场景名）
+- 若该帧无可匹配场景：请直接省略 sceneNames 字段（不要输出空数组）
 
 3) 变体资产匹配规则：
 - frame.variantNames 填写候选变体资产的 name（角色特定服装/外貌版本）
@@ -3519,9 +3701,11 @@ const App: React.FC = () => {
           .map(name => (currentProject.variants ?? []).find(v => v.name === name)?.id)
           .filter((id): id is string => !!id);
 
-        const sceneId = f.sceneName
-          ? currentProject.scenes.find(s => s.name.toLowerCase().includes(f.sceneName!.toLowerCase()))?.id
-          : undefined;
+        const sceneNames = (f.sceneNames ?? (f.sceneName ? [f.sceneName] : []));
+        const sceneIds = sceneNames
+          .map(name => currentProject.scenes.find(s => s.name.toLowerCase().includes(name.toLowerCase()))?.id)
+          .filter((id): id is string => !!id);
+        const deduped = [...new Set(sceneIds)];
 
         const dialogues = normalizeDialogues(f.dialogues) ?? splitDialogueStringToDialogues(f.dialogue);
         const dialogue = mergeDialoguesToDisplayString(dialogues) ?? f.dialogue;
@@ -3535,10 +3719,10 @@ const App: React.FC = () => {
           dialogue,
           originalText: f.originalText,
           references: {
-            characterIds: [...new Set(charIds)], // Dedupe
+            characterIds: [...new Set(charIds)],
             variantIds: variantIds.length > 0 ? [...new Set(variantIds)] : undefined,
-            sceneId: sceneId,
-            sceneIds: sceneId ? [sceneId] : undefined,
+            sceneId: deduped[0],
+            sceneIds: deduped.length > 0 ? deduped : undefined,
           }
         };
       });
@@ -3546,7 +3730,7 @@ const App: React.FC = () => {
       Logger.logInfo('分镜帧映射完成', {
         framesCount: newFrames.length,
         framesWithCharacters: newFrames.filter(f => f.references.characterIds.length > 0).length,
-        framesWithScene: newFrames.filter(f => f.references.sceneId).length
+        framesWithScene: newFrames.filter(f => f.references.sceneIds && f.references.sceneIds.length > 0).length
       });
 
       // Update Episode State
@@ -4218,6 +4402,10 @@ const App: React.FC = () => {
               imageError: undefined
             } : f
           );
+          newProj.episodes[epIndex] = {
+            ...newProj.episodes[epIndex],
+            updatedAt: Date.now()
+          };
           newProj.updatedAt = Date.now();
           newProjects[projIndex] = newProj;
           return newProjects;
@@ -4270,21 +4458,17 @@ const App: React.FC = () => {
               console.log('[MODERATION] auto-rewrite retry', { frameId, model: rewriteModel, notes });
 
               // 轻量 PATCH 保存：只更新文本字段，不发送整个项目（避免 request entity too large）
-              const newUpdatedAt = Date.now();
               try {
                 await apiService.updateFrameTextFields(projectId, episodeId, frameId, { imagePrompt: cleaned });
-                // 预写快照，阻止防抖自动保存触发（防止随后的 setProjects 再次触发全量保存）
-                savedProjectsRef.current?.set(projectId, newUpdatedAt);
               } catch (saveErr) {
-                console.warn('[MODERATION] 轻量保存失败，将依赖全量自动保存', saveErr);
+                console.warn('[MODERATION] 轻量保存失败，将依赖分集自动保存', saveErr);
               }
 
-              // 更新 React 状态（UI 显示新提示词），用相同的 updatedAt 让防抖自动保存无感知
+              // 更新 React 状态（UI 显示新提示词）
               setProjects(prev => prev.map(p => {
                 if (p.id !== projectId) return p;
                 return {
                   ...p,
-                  updatedAt: newUpdatedAt,
                   episodes: p.episodes.map(ep => {
                     if (ep.id !== episodeId) return ep;
                     return {
@@ -4426,7 +4610,7 @@ const App: React.FC = () => {
           );
         } else if (model === 'bltcy-sora-2') {
           videoUrl = await generateVideoWithBltcySora(
-            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl, 'sora-2'
           );
         } else if (model === 'bltcy-veo3') {
           videoUrl = await generateVideoWithBltcyVeo3(
@@ -4434,6 +4618,10 @@ const App: React.FC = () => {
           );
         } else if (model === 'bltcy-wan-2-6') {
           videoUrl = await generateVideoWithBltcyWan26(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
+          );
+        } else if (model === 'bltcy-grok-video-3') {
+          videoUrl = await generateVideoWithBltcyGrokVideo3(
             capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
           );
         } else {
@@ -4735,6 +4923,20 @@ const App: React.FC = () => {
                      <div className="flex items-center gap-2 text-xs text-gray-400">
                         <Users size={12}/> {project.characters.length}
                         <button
+                          onClick={(e) => handleRenameProject(e, project.id)}
+                          className="p-1 rounded bg-black/40 text-gray-400 hover:text-emerald-400 hover:bg-gray-800 transition-colors"
+                          title="重命名项目"
+                        >
+                          <Edit2 size={12} />
+                        </button>
+                        <button
+                          onClick={(e) => handleDuplicateProject(e, project.id)}
+                          className="p-1 rounded bg-black/40 text-gray-400 hover:text-blue-400 hover:bg-gray-800 transition-colors"
+                          title="复制项目"
+                        >
+                          <Copy size={12} />
+                        </button>
+                        <button
                           onClick={(e) => handleDeleteProject(e, project.id)}
                           className="p-1 rounded bg-black/40 text-gray-400 hover:text-red-400 hover:bg-gray-800 transition-colors"
                           title="删除项目"
@@ -4953,6 +5155,7 @@ const App: React.FC = () => {
                                 <option value="bltcy-sora-2">柏拉图中转 Sora 2</option>
                                 <option value="bltcy-veo3">柏拉图中转 Veo 3.1</option>
             <option value="bltcy-wan-2-6">柏拉图中转 Wan 2.6</option>
+                                <option value="bltcy-grok-video-3">柏拉图中转 grok-video-3</option>
                                 <option value="veo-3.1-fast-generate-preview">Veo 3.1 Fast</option>
                                 <option value="veo-3.1-generate-preview">Veo 3.1 High Quality</option>
                               </select>
@@ -5007,7 +5210,7 @@ const App: React.FC = () => {
         <header className="h-16 bg-gray-950 border-b border-gray-800 flex items-center justify-between px-6 shrink-0">
            <div className="flex items-center gap-4">
               <button 
-                onClick={() => setViewMode(ViewMode.PROJECT_LIST)}
+                onClick={() => { setSelectedEpisodeIds(new Set()); setViewMode(ViewMode.PROJECT_LIST); }}
                 className="p-2 hover:bg-gray-800 rounded-lg text-gray-400 hover:text-white transition-colors"
               >
                 <ArrowLeft size={20} />
@@ -5046,34 +5249,113 @@ const App: React.FC = () => {
         <div className="flex-1 min-h-0 overflow-y-auto">
           <div className="p-8 max-w-6xl mx-auto w-full pb-10">
            <div className="flex justify-between items-center mb-8">
-              <h2 className="text-2xl font-bold flex items-center gap-2">
-                <FileText className="text-purple-500"/> 分集列表
-              </h2>
-              <button 
-                onClick={handleCreateEpisode}
-                className="bg-purple-600 hover:bg-purple-500 text-white px-5 py-2.5 rounded-lg flex items-center gap-2 font-medium transition-all"
-              >
-                <Plus size={18} /> 新建分集
-              </button>
+              <div className="space-y-2">
+                <h2 className="text-2xl font-bold flex items-center gap-2">
+                  <FileText className="text-purple-500"/> 分集列表
+                </h2>
+                {failedPreprocessEpisodes.length > 0 && (
+                  <div className="text-sm text-amber-300 bg-amber-900/20 border border-amber-700/40 rounded-lg px-3 py-2 inline-flex items-center gap-2">
+                    <AlertCircle size={16} />
+                    有 {failedPreprocessEpisodes.length} 个分集预处理分段失败，当前展示的是回退原文。
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-3">
+                {selectedEpisodeIds.size > 0 && (
+                  <>
+                    <button
+                      onClick={() => {
+                        if (!currentProject) return;
+                        if (selectedEpisodeIds.size === currentProject.episodes.length) {
+                          setSelectedEpisodeIds(new Set());
+                        } else {
+                          setSelectedEpisodeIds(new Set(currentProject.episodes.map(e => e.id)));
+                        }
+                      }}
+                      className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium transition-all"
+                    >
+                      {currentProject && selectedEpisodeIds.size === currentProject.episodes.length ? '取消全选' : '全选'}
+                    </button>
+                    <button
+                      onClick={handleDeleteSelectedEpisodes}
+                      className="bg-red-600 hover:bg-red-500 text-white px-4 py-2.5 rounded-lg flex items-center gap-2 text-sm font-medium transition-all"
+                    >
+                      <Trash2 size={16} /> 删除 ({selectedEpisodeIds.size})
+                    </button>
+                    <div className="w-px h-8 bg-gray-700" />
+                  </>
+                )}
+                {failedPreprocessEpisodes.length > 0 && (
+                  <button
+                    onClick={handleRetryFailedPreprocessEpisodes}
+                    disabled={isPreprocessing}
+                    className="bg-amber-600 hover:bg-amber-500 disabled:opacity-50 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-lg flex items-center gap-2 font-medium transition-all"
+                  >
+                    {isPreprocessing ? <Loader2 size={18} className="animate-spin" /> : <RefreshCw size={18} />}
+                    重试失败预处理 ({failedPreprocessEpisodes.length})
+                  </button>
+                )}
+                <button
+                  onClick={() => setShowNovelPreprocessModal(true)}
+                  className="bg-gray-700 hover:bg-gray-600 text-white px-5 py-2.5 rounded-lg flex items-center gap-2 font-medium transition-all"
+                >
+                  <FileText size={18} /> 小说预处理
+                </button>
+                <button
+                  onClick={handleCreateEpisode}
+                  className="bg-purple-600 hover:bg-purple-500 text-white px-5 py-2.5 rounded-lg flex items-center gap-2 font-medium transition-all"
+                >
+                  <Plus size={18} /> 新建分集
+                </button>
+              </div>
            </div>
 
            <div className="grid grid-cols-1 gap-4">
               {currentProject.episodes.map((episode, index) => (
-                 <div 
+                 <div
                    key={episode.id}
-                   onClick={() => { 
-                      setCurrentEpisodeId(episode.id); 
+                   onClick={() => {
+                      if (selectedEpisodeIds.size > 0) {
+                        setSelectedEpisodeIds(prev => {
+                          const next = new Set(prev);
+                          next.has(episode.id) ? next.delete(episode.id) : next.add(episode.id);
+                          return next;
+                        });
+                        return;
+                      }
+                      setCurrentEpisodeId(episode.id);
                       setViewMode(ViewMode.EPISODE_DETAIL);
-                      setActiveTab(ProjectTab.SCRIPT); 
+                      setActiveTab(ProjectTab.SCRIPT);
                     }}
-                   className="bg-gray-800 border border-gray-700 rounded-xl p-5 hover:border-purple-500/50 hover:bg-gray-750 transition-all cursor-pointer group flex items-center justify-between"
+                   className={`bg-gray-800 border rounded-xl p-5 hover:border-purple-500/50 hover:bg-gray-750 transition-all cursor-pointer group flex items-center justify-between ${selectedEpisodeIds.has(episode.id) ? 'border-purple-500 bg-purple-500/5' : 'border-gray-700'}`}
                  >
                     <div className="flex items-center gap-6">
+                       <button
+                         onClick={(e) => {
+                           e.stopPropagation();
+                           setSelectedEpisodeIds(prev => {
+                             const next = new Set(prev);
+                             next.has(episode.id) ? next.delete(episode.id) : next.add(episode.id);
+                             return next;
+                           });
+                         }}
+                         className="flex-shrink-0 text-gray-500 hover:text-purple-400 transition-colors"
+                       >
+                         {selectedEpisodeIds.has(episode.id) ? <CheckSquare size={20} className="text-purple-400" /> : <Square size={20} />}
+                       </button>
                        <div className="w-12 h-12 bg-gray-900 rounded-lg flex items-center justify-center text-gray-600 font-bold text-lg border border-gray-800">
                           {index + 1}
                        </div>
                        <div>
-                          <h3 className="text-lg font-semibold text-white mb-1 group-hover:text-purple-400 transition-colors">{episode.name}</h3>
+                          <div className="flex items-center gap-2 mb-1">
+                             <h3 className="text-lg font-semibold text-white group-hover:text-purple-400 transition-colors">{episode.name}</h3>
+                             {episode.preprocessSegmentFailed && (
+                               <span className="inline-flex items-center gap-1 rounded-full border border-amber-700/50 bg-amber-900/30 px-2 py-0.5 text-xs text-amber-200">
+                                 <AlertCircle size={12} />
+                                 预处理失败
+                               </span>
+                             )}
+                          </div>
                           <div className="flex items-center gap-4 text-sm text-gray-500">
                              <span className="flex items-center gap-1"><Clock size={14}/> {new Date(episode.updatedAt || Date.now()).toLocaleDateString()}</span>
                              <span>{episode.scriptContent.length > 0 ? `${episode.scriptContent.length} 字` : '空剧本'}</span>
@@ -5120,6 +5402,88 @@ const App: React.FC = () => {
            </div>
           </div>
         </div>
+
+        {/* 小说预处理 Modal */}
+        {showNovelPreprocessModal && (
+          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+            <div className="bg-gray-800 rounded-2xl w-full max-w-2xl border border-gray-700 shadow-2xl flex flex-col max-h-[90vh]">
+              <div className="p-5 border-b border-gray-700 flex justify-between items-center">
+                <h2 className="text-xl font-bold flex items-center gap-2">
+                  <FileText size={18} className="text-purple-400" /> 小说预处理
+                </h2>
+                <button onClick={() => { setShowNovelPreprocessModal(false); setPreprocessNovelText(''); }} className="text-gray-400 hover:text-white">
+                  <X size={24} />
+                </button>
+              </div>
+              <div className="p-6 flex flex-col gap-4 overflow-y-auto custom-scrollbar flex-1">
+                <div>
+                  <label className="block text-xs font-medium text-gray-400 mb-2">选择番茄小说 txt 文件</label>
+                  <label className={`flex flex-col items-center justify-center w-full h-32 border-2 border-dashed rounded-lg cursor-pointer transition-colors ${preprocessNovelText ? 'border-purple-500 bg-purple-900/10' : 'border-gray-600 hover:border-gray-500 bg-gray-900'}`}>
+                    <div className="flex flex-col items-center gap-2 text-gray-400">
+                      <Upload size={24} className={preprocessNovelText ? 'text-purple-400' : ''} />
+                      {preprocessNovelText ? (
+                        <span className="text-sm text-purple-300">文件已加载，共 {preprocessNovelText.length.toLocaleString()} 字</span>
+                      ) : (
+                        <span className="text-sm">点击选择 .txt 文件</span>
+                      )}
+                    </div>
+                    <input
+                      type="file"
+                      accept=".txt"
+                      className="hidden"
+                      onChange={e => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        const reader = new FileReader();
+                        reader.onload = ev => setPreprocessNovelText((ev.target?.result as string) ?? '');
+                        reader.readAsText(file, 'UTF-8');
+                        e.target.value = '';
+                      }}
+                    />
+                  </label>
+                </div>
+                {preprocessNovelText.trim() && (() => {
+                  const titles = detectEpisodeTitles(preprocessNovelText);
+                  return (
+                    <div className="bg-gray-900 rounded-lg p-4 border border-gray-700">
+                      <p className="text-xs font-medium text-gray-400 mb-2">
+                        识别预览：检测到 <span className="text-purple-400 font-bold">{titles.length}</span> 个分集
+                      </p>
+                      {titles.length > 0 ? (
+                        <ul className="space-y-1 max-h-40 overflow-y-auto custom-scrollbar">
+                          {titles.map((t, i) => (
+                            <li key={i} className="text-sm text-gray-300 flex items-center gap-2">
+                              <span className="text-purple-500 text-xs w-6 shrink-0">{i + 1}.</span> {t}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-sm text-yellow-400">未检测到章节序号，请确认文件格式正确</p>
+                      )}
+                    </div>
+                  );
+                })()}
+                <p className="text-xs text-gray-500">资产提取将使用文本前 8000 字；分集将追加到现有列表。</p>
+              </div>
+              <div className="p-5 border-t border-gray-700 flex justify-end gap-3">
+                <button
+                  onClick={() => { setShowNovelPreprocessModal(false); setPreprocessNovelText(''); }}
+                  className="px-5 py-2.5 rounded-lg text-gray-300 hover:bg-gray-700 font-medium"
+                  disabled={isPreprocessing}
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleNovelPreprocess}
+                  disabled={isPreprocessing || !preprocessNovelText.trim() || detectEpisodeTitles(preprocessNovelText).length === 0}
+                  className="px-6 py-2.5 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-white font-medium flex items-center gap-2 transition-colors"
+                >
+                  {isPreprocessing ? <><Loader2 size={16} className="animate-spin" /> 处理中...</> : '开始预处理'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Project Settings Modal */}
         {showSettingsModal && (
@@ -5235,6 +5599,12 @@ const App: React.FC = () => {
                   </div>
                 </div>
               </div>
+              {currentEpisode.preprocessSegmentFailed && (
+                <div className="bg-amber-900/20 border border-amber-700/40 rounded-2xl px-4 py-3 text-sm text-amber-200 flex items-center gap-2">
+                  <AlertCircle size={16} className="shrink-0" />
+                  当前分集在小说预处理分段时失败，现使用回退原文。返回分集列表可点击“重试失败预处理”。
+                </div>
+              )}
               <textarea
                 className="flex-1 w-full bg-gray-800 border border-gray-700 rounded-2xl p-6 sm:p-7 text-gray-100 focus:outline-none focus:border-purple-500 resize-none font-serif leading-relaxed text-base sm:text-lg shadow-inner"
                 placeholder="在此粘贴章节内容..."

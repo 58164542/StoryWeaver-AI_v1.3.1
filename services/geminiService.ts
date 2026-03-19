@@ -312,6 +312,7 @@ export const generateStoryboardBreakdown = async (
     - originalText: The segment of the original text this frame covers.
     - characterNames: A list of character names or aliases present in this frame.
     - sceneName: The name of the scene where this takes place.
+    - sceneNames: List of scene names where this frame takes place (supports multiple scenes).
 
     Text:
     ${text.substring(0, 30000)}
@@ -346,7 +347,7 @@ export const generateStoryboardBreakdown = async (
                 },
                 originalText: { type: Type.STRING },
                 characterNames: { type: Type.ARRAY, items: { type: Type.STRING } },
-                sceneName: { type: Type.STRING },
+                sceneNames: { type: Type.ARRAY, items: { type: Type.STRING } },
               }
             }
           }

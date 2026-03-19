@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
 import fs from 'fs/promises';
+import { v4 as uuidv4 } from 'uuid';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, '../../data');
@@ -49,6 +50,14 @@ const DEFAULT_DATA = {
 
 let db = null;
 
+function ensureProjectId(project) {
+  if (!project || typeof project !== 'object') return false;
+  if (project.id) return false;
+
+  project.id = project.projectId || project._id || uuidv4();
+  return true;
+}
+
 /**
  * 初始化数据库
  */
@@ -74,10 +83,26 @@ export async function initDatabase() {
       await db.write();
       console.log('✅ 数据库初始化完成，使用默认数据');
     } else {
+      let changed = false;
+
       if (!db.data.recycleBin) {
         db.data.recycleBin = [];
-        await db.write();
+        changed = true;
       }
+
+      for (const project of db.data.projects) {
+        changed = ensureProjectId(project) || changed;
+      }
+
+      for (const project of db.data.recycleBin) {
+        changed = ensureProjectId(project) || changed;
+      }
+
+      if (changed) {
+        await db.write();
+        console.log('✅ 已自动补齐旧项目缺失的 ID');
+      }
+
       console.log('✅ 数据库加载成功');
     }
 

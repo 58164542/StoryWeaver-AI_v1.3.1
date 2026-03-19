@@ -4,7 +4,7 @@ import { Logger } from "../utils/logger";
 const VOLCENGINE_API_URL = "https://ark.cn-beijing.volces.com/api/v3/responses";
 const VOLCENGINE_VIDEO_API_URL = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks";
 const GRSAI_CHAT_API_URL = "https://grsaiapi.com/v1/chat/completions";
-const VOLCENGINE_CONNECTIVITY_TIMEOUT_MS = 60;
+const VOLCENGINE_CONNECTIVITY_TIMEOUT_MS = 3000;
 const VOLCENGINE_CONNECTIVITY_MODEL = "doubao-seed-1-6-250615";
 
 /**
@@ -216,7 +216,10 @@ const STORYBOARD_SCHEMA = {
             type: "array",
             items: { type: "string" }
           },
-          sceneName: { type: "string" }
+          sceneNames: {
+            type: "array",
+            items: { type: "string" }
+          }
         },
         required: ["imagePrompt", "videoPrompt", "originalText"],
         additionalProperties: false
@@ -781,7 +784,7 @@ export const generateStoryboardBreakdown = async (
 - dialogue: （兼容字段，可选）将 dialogues 合并成多行字符串
 - originalText: 该帧对应的原始文本片段
 - characterNames: 该帧中出现的所有角色名字或别名列表（可选）
-- sceneName: 该帧发生的场景名称（可选）
+- sceneNames: 该帧发生的场景名称列表（可选，可匹配多个场景）
 
 文本内容：
 ${text.substring(0, 30000)}
@@ -918,7 +921,7 @@ export const generateStoryboardBreakdownWithGrsai = async (
 - dialogue: （兼容字段，可选）将 dialogues 合并成多行字符串
 - originalText: 该帧对应的原始文本片段
 - characterNames: 该帧中出现的角色名字或别名列表（可选）
-- sceneName: 该帧发生的场景名称（可选）
+- sceneNames: 该帧发生的场景名称列表（可选，可匹配多个场景）
 
 文本内容：
 ${text.substring(0, 30000)}

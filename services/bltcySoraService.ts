@@ -6,7 +6,7 @@ const BLTCY_BASE_URL = "https://api.bltcy.ai";
 const BLTCY_MODEL = "sora-2";
 const BLTCY_WAN_MODEL = "wan2.6-i2v";
 
-const getBltcyApiKey = (envKey: "BLTCY_API_KEY" | "BLTCY_WAN_API_KEY"): string => {
+const getBltcyApiKey = (envKey: "BLTCY_API_KEY" | "BLTCY_VIP_API_KEY" | "BLTCY_WAN_API_KEY"): string => {
   const apiKey = process.env[envKey];
   if (!apiKey || apiKey === "PLACEHOLDER_API_KEY") {
     throw new Error(`请在 .env.local 文件中配置 ${envKey}`);
@@ -66,6 +66,21 @@ const blobToDataUrl = (blob: Blob): Promise<string> =>
     reader.onerror = () => reject(reader.error ?? new Error("读取图片失败"));
     reader.readAsDataURL(blob);
   });
+
+const dataUrlToBase64 = (dataUrl: string): string => {
+  const commaIndex = dataUrl.indexOf(",");
+  if (commaIndex === -1) {
+    throw new Error("无效的 base64 data URL");
+  }
+  return dataUrl.slice(commaIndex + 1);
+};
+
+const normalizeBase64DataUrl = (value: string, fallbackMimeType: string = "image/jpeg"): string => {
+  if (isBase64DataUrl(value)) return value;
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) throw new Error("缺少图片数据");
+  return `data:${fallbackMimeType};base64,${trimmed}`;
+};
 
 const convertBlobToJpegDataUrl = (blob: Blob): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -169,19 +184,40 @@ export const generateVideoWithBltcySora = async (
   githubImageUrl?: string,
   model: string = BLTCY_MODEL,
   imageAsString: boolean = false,
-  apiKeyEnv: "BLTCY_API_KEY" | "BLTCY_WAN_API_KEY" = "BLTCY_API_KEY"
+  apiKeyEnv: "BLTCY_API_KEY" | "BLTCY_VIP_API_KEY" | "BLTCY_WAN_API_KEY" = "BLTCY_VIP_API_KEY"
 ): Promise<string> => {
   const apiKey = getBltcyApiKey(apiKeyEnv);
 
-  // 确保图片 URL 为可公开访问的地址
+  // 柏拉图 Sora 2 改为直接传 base64；其他模型保持原有 URL 逻辑
   let finalImageUrl: string;
   const normalizedImageUrl = normalizeImageUrlInput(imageUrl);
+  const normalizedGithubImageUrl = normalizeImageUrlInput(githubImageUrl ?? "");
+  const shouldSendBase64Image = apiKeyEnv === "BLTCY_VIP_API_KEY" && model === BLTCY_MODEL;
+
   if (apiKeyEnv === "BLTCY_WAN_API_KEY") {
     try {
       finalImageUrl = await ensureWanCompatibleImageUrl(normalizedImageUrl, githubImageUrl, projectId);
     } catch (error) {
       Logger.logError("BltcyWan", "图片准备失败", error);
       throw new Error(`图片上传到 GitHub 失败: ${error instanceof Error ? error.message : "未知错误"}`);
+    }
+  } else if (shouldSendBase64Image) {
+    const source = normalizedImageUrl || normalizedGithubImageUrl;
+    if (!source) {
+      throw new Error("生成视频失败: 缺少参考图");
+    }
+
+    if (isBase64DataUrl(source)) {
+      Logger.logInfo("BltcySora 检测到 Base64 图片，直接传给柏拉图 Sora", { projectId });
+      finalImageUrl = source;
+    } else {
+      Logger.logInfo("BltcySora 读取图片为 Base64 后传给柏拉图 Sora", { imageUrl: source });
+      try {
+        finalImageUrl = await readMediaAsBase64(source);
+      } catch (error) {
+        Logger.logError("BltcySora", "图片读取为 Base64 失败", error);
+        throw new Error(`图片读取为 Base64 失败: ${error instanceof Error ? error.message : "未知错误"}`);
+      }
     }
   } else if (githubImageUrl) {
     Logger.logInfo("BltcySora 使用已有 GitHub URL", { githubImageUrl });
@@ -213,7 +249,11 @@ export const generateVideoWithBltcySora = async (
   const createPayload = {
     model,
     prompt,
-    images: imageAsString ? [finalImageUrl] : [{ type: "url", url: finalImageUrl }],
+    images: shouldSendBase64Image
+      ? [normalizeBase64DataUrl(finalImageUrl)]
+      : imageAsString
+        ? [dataUrlToBase64(finalImageUrl)]
+        : [{ type: "url", url: finalImageUrl }],
     duration,
     aspect_ratio: aspectRatio,
   };
@@ -337,4 +377,25 @@ export const generateVideoWithBltcyWan26 = (
     BLTCY_WAN_MODEL,
     true,
     "BLTCY_WAN_API_KEY"
+  );
+
+export const generateVideoWithBltcyGrokVideo3 = (
+  imageUrl: string,
+  prompt: string,
+  aspectRatio: "16:9" | "9:16" | "1:1" | "4:3" | "3:4",
+  duration: number = 5,
+  projectId: string,
+  onProgress?: (progress: number) => void,
+  githubImageUrl?: string
+): Promise<string> =>
+  generateVideoWithBltcySora(
+    imageUrl,
+    prompt,
+    aspectRatio,
+    duration,
+    projectId,
+    onProgress,
+    githubImageUrl,
+    "grok-video-3",
+    true
   );

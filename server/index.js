@@ -10,10 +10,13 @@ import projectsRouter from './routes/projects.js';
 import mediaRouter from './routes/media.js';
 import ttsRouter from './routes/tts.js';
 import jianyingRouter from './routes/jianying.js';
+import klingRouter from './routes/kling.js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { readFile } from 'fs/promises';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const segmentSkillPromptPath = join(__dirname, '../System_Prompt/分段SKILL.md');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -34,6 +37,17 @@ app.use('/api/projects', projectsRouter);
 app.use('/api/media', mediaRouter);
 app.use('/api/tts', ttsRouter);
 app.use('/api/jianying', jianyingRouter);
+app.use('/api/kling', klingRouter);
+
+app.get('/api/system-prompts/segment-skill', async (req, res) => {
+  try {
+    const content = await readFile(segmentSkillPromptPath, 'utf8');
+    res.json({ success: true, data: { content } });
+  } catch (error) {
+    console.error('读取分段 prompt 失败:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 // 全局设置
 app.get('/api/settings', (req, res) => {
@@ -160,6 +174,14 @@ app.get('/api/proxy', async (req, res) => {
 // 健康检查
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'StoryWeaver AI 服务器运行中' });
+});
+
+// 未匹配的 API 统一返回 JSON，避免前端把 HTML 当 JSON 解析
+app.use('/api', (req, res) => {
+  res.status(404).json({
+    success: false,
+    error: `API 路由不存在: ${req.method} ${req.originalUrl}`,
+  });
 });
 
 // 提供静态文件服务（打包后的前端）
