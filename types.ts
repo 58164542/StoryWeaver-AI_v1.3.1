@@ -12,7 +12,7 @@ export enum ProjectTab {
   EXPORT = 'EXPORT',
 }
 
-export type ProjectType = 'REAL_PERSON_COMMENTARY' | 'COMMENTARY_2D' | 'COMMENTARY_3D' | 'PREMIUM_2D' | 'PREMIUM_3D';
+export type ProjectType = string;
 
 export interface ProjectTypeInstruction {
   assetImagePrefix: string;      // 角色/变体生图提示词前缀
@@ -23,17 +23,33 @@ export interface ProjectTypeInstruction {
   characterExtraction: string;   // 角色提取提示词
   sceneExtraction: string;       // 场景提取提示词
   storyboardBreakdown: string;   // 分镜拆解提示词
+  preprocessSegmentPrompt: string; // 小说预处理分段提示词
 }
 
 export interface GlobalSettings {
   extractionModel: string;
   multiRefVideoModel?: string; // 多参考生视频模型
-  projectTypePrompts: Record<ProjectType, ProjectTypeInstruction>;
+  projectTypePrompts: Record<string, ProjectTypeInstruction>;
+  projectTypeLabels?: Record<string, string>; // 项目类型的自定义显示名称
   jianyingExportPath?: string; // 剪映工程导出目录路径
   jianyingExportPathFull?: string; // 剪映工程导出目录完整路径
   defaultImageDuration?: number; // 图片默认时长（秒），默认3秒
   placeholderColor?: string; // 空分镜占位颜色，默认黑色 #000000
   ttsSpeed?: number; // TTS 语速，范围 0.5-2.0，默认 1.0
+}
+
+export interface SeedanceSession {
+  id: string;
+  name: string;
+  status: 'active' | 'expired' | 'insufficient' | 'disabled';
+  credits: number | null;
+  lastUsed: number;
+  currentTasks: number;
+  totalTasks: number;
+  successCount: number;
+  failCount: number;
+  maxConcurrent: number;
+  createdAt: number;
 }
 
 export interface ProjectSettings {

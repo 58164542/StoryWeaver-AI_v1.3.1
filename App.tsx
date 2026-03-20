@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import {
-  Project, Episode, ViewMode, ProjectTab, Character, Scene, StoryboardFrame, ProjectType, ProjectSettings, GlobalSettings, ProjectTypeInstruction, StoryboardDialogueLine, CharacterVariant
+  Project, Episode, ViewMode, ProjectTab, Character, Scene, StoryboardFrame, ProjectType, ProjectSettings, GlobalSettings, ProjectTypeInstruction, StoryboardDialogueLine, CharacterVariant, SeedanceSession
 } from './types';
 import { Layout } from './components/Layout';
 import { analyzeNovelScript as analyzeNovelScriptGemini, generateStoryboardBreakdown as generateStoryboardBreakdownGemini, generateImageAsset, generateVideoFromImage, generateSpeech } from './services/geminiService';
@@ -9,6 +9,7 @@ import { analyzeNovelScript as analyzeNovelScriptVolcengine, analyzeNovelScriptW
 import { generateVideoWithSeedance, generateVideoWithSeedanceMultiRef } from './services/seedanceService';
 import { generateVideoWithSora } from './services/soraService';
 import { generateVideoWithKlingOmni } from './services/klingService';
+import { generateVideoWithJimengSeedance, generateVideoWithJimengSeedanceMultiRef } from './services/jimengSeedanceService';
 import { generateVideoWithBltcySora, generateVideoWithBltcyVeo3, generateVideoWithBltcyWan26, generateVideoWithBltcyGrokVideo3 } from './services/bltcySoraService';
 import { generateImageWithBananaPro } from './services/bananaProService';
 import { generateImageWithVolcengine } from './services/volcengineImageService';
@@ -20,12 +21,12 @@ import { exportToJianying } from './services/jianyingService';
 import { Logger } from './utils/logger';
 import { taskQueue } from './utils/taskQueue';
 import { splitNovelIntoEpisodes, detectEpisodeTitles } from './utils/novelSplitter';
-import { analyzeNovelScriptWithClaude, segmentEpisodeWithClaude } from './services/claudeService';
+import { analyzeNovelScriptWithClaude, generateStoryboardBreakdownWithClaude, segmentEpisodeWithClaude } from './services/claudeService';
 import { createDuplicatedProject } from './utils/projectDuplication.js';
 import { PREPROCESS_SEGMENT_CONCURRENCY, mapWithConcurrencyLimit } from './utils/segmentConcurrency.js';
 import { buildEpisodeFromPreprocessResult, getFailedPreprocessEpisodes } from './utils/preprocessSegmentation.js';
 import { generateFrameAudioWithMinimax } from './services/ttsService';
-import { Loader2, Plus, Trash2, Save, Wand2, Image as ImageIcon, Play, Pause, SkipBack, SkipForward, Download, Users, Film, ArrowLeft, FileText, Clock, Settings, X, Link, Edit2, Check, LayoutGrid, Clapperboard, ChevronRight, ChevronLeft, Globe, Copy, CheckSquare, Square, GripVertical, MoreHorizontal, Volume2, Mic, AlertCircle, RefreshCw, Eye, Upload } from 'lucide-react';
+import { Loader2, Plus, Trash2, Save, Wand2, Image as ImageIcon, Play, Pause, SkipBack, SkipForward, Download, Users, Film, ArrowLeft, FileText, Clock, Settings, X, Link, Edit2, Check, LayoutGrid, Clapperboard, ChevronRight, ChevronLeft, Globe, Copy, CheckSquare, Square, GripVertical, MoreHorizontal, Volume2, Mic, AlertCircle, RefreshCw, Eye, Upload, Search } from 'lucide-react';
 import * as apiService from './services/apiService';
 
 // Default Settings
@@ -48,6 +49,13 @@ const DEFAULT_PROJECT_PROMPTS = {
 const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
   extractionModel: 'doubao-seed-2-0-pro-260215',
   jianyingExportPathFull: '',
+  projectTypeLabels: {
+    'REAL_PERSON_COMMENTARY': '真人解说漫',
+    'COMMENTARY_2D': '2D解说漫',
+    'COMMENTARY_3D': '3D解说漫',
+    'PREMIUM_2D': '2D精品',
+    'PREMIUM_3D': '3D精品',
+  },
   projectTypePrompts: {
     'REAL_PERSON_COMMENTARY': {
         assetImagePrefix: '真人实拍风格，写实摄影，4k分辨率，细腻的皮肤质感，自然光，角色参考图',
@@ -102,12 +110,12 @@ const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
   }
 };
 
-const PROJECT_TYPE_LABELS: Record<ProjectType, string> = {
-    'REAL_PERSON_COMMENTARY': '真人解说漫',
-    'COMMENTARY_2D': '2D解说漫',
-    'COMMENTARY_3D': '3D解说漫',
-    'PREMIUM_2D': '2D精品',
-    'PREMIUM_3D': '3D精品'
+// Helper function to get project type label
+const getProjectTypeLabel = (type: string, labels?: Record<string, string>): string => {
+  if (labels && labels[type]) {
+    return labels[type];
+  }
+  return type;
 };
 
 const migrateImageModel = (model?: string) => {
@@ -387,6 +395,38 @@ const isJarvisNanoBanana2Model = (model: string) => model === 'jarvis-nano-banan
 const isBltcyBanana2Model = (model: string) => model === 'bltcy-banana-2';
 const isBltcyNanoBananaHdModel = (model: string) => model === 'bltcy-nano-banana-hd';
 const isBltcyNanoBananaProModel = (model: string) => model === 'bltcy-nano-banana-pro';
+
+const generateAssetImageWithSelectedModel = async (
+  prompt: string,
+  model: string,
+  projectId: string,
+  onProgress: (progress: number) => void
+): Promise<string> => {
+  if (isBananaProImageModel(model)) {
+    return generateImageWithBananaPro(prompt, '16:9', [], '2K', onProgress, model);
+  }
+  if (isVolcengineImageModel(model)) {
+    return generateImageWithVolcengine(prompt, '16:9', [], '2K', onProgress, model);
+  }
+  if (isXskillNanoBanana2Model(model)) {
+    return generateImageWithXskillNanoBanana2(prompt, '16:9', [], projectId, onProgress);
+  }
+  if (isJarvisNanoBanana2Model(model)) {
+    return generateImageWithJarvisNanoBanana2(prompt, '16:9', [], projectId, onProgress);
+  }
+  if (isBltcyBanana2Model(model)) {
+    return generateImageWithBltcyBanana2(prompt, '16:9', [], projectId, onProgress);
+  }
+  if (isBltcyNanoBananaHdModel(model)) {
+    return generateImageWithBltcyNanoBananaHd(prompt, '16:9', [], projectId, onProgress);
+  }
+  if (isBltcyNanoBananaProModel(model)) {
+    return generateImageWithBltcyNanoBananaPro(prompt, '16:9', [], projectId, onProgress);
+  }
+  return generateImageAsset(prompt, '16:9', model);
+};
+
+const isClaudeChatModel = (model: string) => model.startsWith('claude-');
 const isGrsaiChatModel = (model: string) => model.startsWith('grsai-');
 const getGrsaiChatModelName = (model: string) => model.replace(/^grsai-/, '');
 
@@ -447,6 +487,195 @@ const getDialoguesTextOnly = (dialogues?: StoryboardDialogueLine[]): string | un
 };
 
 // --- Helper Components ---
+
+// --- Find & Replace Modal ---
+interface FindReplaceModalProps {
+  projects: Project[];
+  currentProject: Project;
+  currentEpisode: Episode;
+  onReplace: (updates: { projectId: string; episodeId: string; frames: StoryboardFrame[] }[]) => void;
+  onClose: () => void;
+}
+
+const FindReplaceModal: React.FC<FindReplaceModalProps> = ({ projects, currentProject, currentEpisode, onReplace, onClose }) => {
+  const [searchText, setSearchText] = useState('');
+  const [replaceText, setReplaceText] = useState('');
+  const [replaceImagePrompt, setReplaceImagePrompt] = useState(true);
+  const [replaceVideoPrompt, setReplaceVideoPrompt] = useState(true);
+  const [scope, setScope] = useState<'current' | 'all'>('current');
+
+  // Compute match stats
+  const matchStats = React.useMemo(() => {
+    if (!searchText) return { frameCount: 0, matchCount: 0 };
+    const episodes: { projectId: string; episodeId: string; frames: StoryboardFrame[] }[] = [];
+    if (scope === 'current') {
+      episodes.push({ projectId: currentProject.id, episodeId: currentEpisode.id, frames: currentEpisode.frames });
+    } else {
+      for (const p of projects) {
+        for (const ep of p.episodes) {
+          episodes.push({ projectId: p.id, episodeId: ep.id, frames: ep.frames });
+        }
+      }
+    }
+    let frameCount = 0;
+    let matchCount = 0;
+    for (const { frames } of episodes) {
+      for (const frame of frames) {
+        let frameMatches = 0;
+        if (replaceImagePrompt && frame.imagePrompt) {
+          frameMatches += frame.imagePrompt.split(searchText).length - 1;
+        }
+        if (replaceVideoPrompt && frame.videoPrompt) {
+          frameMatches += frame.videoPrompt.split(searchText).length - 1;
+        }
+        if (frameMatches > 0) {
+          frameCount++;
+          matchCount += frameMatches;
+        }
+      }
+    }
+    return { frameCount, matchCount };
+  }, [searchText, replaceImagePrompt, replaceVideoPrompt, scope, projects, currentProject, currentEpisode]);
+
+  const handleReplace = () => {
+    if (!searchText || matchStats.matchCount === 0) return;
+    const updates: { projectId: string; episodeId: string; frames: StoryboardFrame[] }[] = [];
+    const episodeSources: { projectId: string; episodeId: string; frames: StoryboardFrame[] }[] = [];
+    if (scope === 'current') {
+      episodeSources.push({ projectId: currentProject.id, episodeId: currentEpisode.id, frames: currentEpisode.frames });
+    } else {
+      for (const p of projects) {
+        for (const ep of p.episodes) {
+          episodeSources.push({ projectId: p.id, episodeId: ep.id, frames: ep.frames });
+        }
+      }
+    }
+    for (const { projectId, episodeId, frames } of episodeSources) {
+      let changed = false;
+      const newFrames = frames.map(frame => {
+        let newImagePrompt = frame.imagePrompt;
+        let newVideoPrompt = frame.videoPrompt;
+        if (replaceImagePrompt && newImagePrompt) {
+          const replaced = newImagePrompt.replaceAll(searchText, replaceText);
+          if (replaced !== newImagePrompt) { newImagePrompt = replaced; changed = true; }
+        }
+        if (replaceVideoPrompt && newVideoPrompt) {
+          const replaced = newVideoPrompt.replaceAll(searchText, replaceText);
+          if (replaced !== newVideoPrompt) { newVideoPrompt = replaced; changed = true; }
+        }
+        if (newImagePrompt !== frame.imagePrompt || newVideoPrompt !== frame.videoPrompt) {
+          return { ...frame, imagePrompt: newImagePrompt, videoPrompt: newVideoPrompt };
+        }
+        return frame;
+      });
+      if (changed) {
+        updates.push({ projectId, episodeId, frames: newFrames });
+      }
+    }
+    onReplace(updates);
+    alert(`已替换 ${matchStats.matchCount} 处`);
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-gray-800 rounded-2xl w-full max-w-lg border border-gray-700 shadow-2xl" onClick={e => e.stopPropagation()}>
+        {/* Header */}
+        <div className="p-5 border-b border-gray-700 flex justify-between items-center">
+          <h2 className="text-lg font-bold flex items-center gap-2">
+            <Search size={18} className="text-blue-500"/> 分镜提示词查找替换
+          </h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">
+            <X size={24} />
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="p-6 space-y-5">
+          {/* Search / Replace inputs */}
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <label className="block text-sm font-medium text-gray-300">查找</label>
+              <input
+                type="text"
+                value={searchText}
+                onChange={e => setSearchText(e.target.value)}
+                className="w-full bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                placeholder="输入要查找的文本..."
+                autoFocus
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="block text-sm font-medium text-gray-300">替换为</label>
+              <input
+                type="text"
+                value={replaceText}
+                onChange={e => setReplaceText(e.target.value)}
+                className="w-full bg-gray-900 border border-gray-600 rounded-lg px-4 py-2.5 text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                placeholder="输入替换后的文本..."
+              />
+            </div>
+          </div>
+
+          {/* Prompt type checkboxes */}
+          <div className="space-y-2">
+            <label className="block text-sm font-medium text-gray-400">替换范围</label>
+            <div className="flex items-center gap-4">
+              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="checkbox" checked={replaceImagePrompt} onChange={e => setReplaceImagePrompt(e.target.checked)} className="rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500" />
+                imagePrompt (生图提示词)
+              </label>
+              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="checkbox" checked={replaceVideoPrompt} onChange={e => setReplaceVideoPrompt(e.target.checked)} className="rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500" />
+                videoPrompt (视频提示词)
+              </label>
+            </div>
+          </div>
+
+          {/* Scope radio */}
+          <div className="space-y-2">
+            <label className="block text-sm font-medium text-gray-400">作用范围</label>
+            <div className="flex items-center gap-4">
+              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="radio" name="scope" checked={scope === 'current'} onChange={() => setScope('current')} className="bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500" />
+                当前分集
+              </label>
+              <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                <input type="radio" name="scope" checked={scope === 'all'} onChange={() => setScope('all')} className="bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500" />
+                所有分集
+              </label>
+            </div>
+          </div>
+
+          {/* Match stats */}
+          <div className="text-sm text-gray-400 bg-gray-900/50 rounded-lg px-4 py-3">
+            {searchText ? (
+              matchStats.matchCount > 0
+                ? <span>匹配结果：在 <span className="text-blue-400 font-medium">{matchStats.frameCount}</span> 个分镜中找到 <span className="text-blue-400 font-medium">{matchStats.matchCount}</span> 处匹配</span>
+                : <span>未找到匹配</span>
+            ) : (
+              <span>请输入查找文本</span>
+            )}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="p-5 border-t border-gray-700 flex justify-end gap-3">
+          <button onClick={onClose} className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-lg transition-colors">
+            取消
+          </button>
+          <button
+            onClick={handleReplace}
+            disabled={!searchText || matchStats.matchCount === 0}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 disabled:text-gray-400 text-white text-sm rounded-lg font-medium transition-colors"
+          >
+            全部替换
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 interface FrameEditorModalProps {
   frame: StoryboardFrame;
@@ -949,6 +1178,8 @@ const ProjectSettingsForm: React.FC<{
           >
             <option value="doubao-seedance-1-5-pro-251215">豆包 Seedance 1.5 Pro (推荐)</option>
             <option value="kling-v3-omni">可灵 Kling v3 Omni</option>
+            <option value="jimeng-seedance-2.0">即梦 Seedance 2.0 Pro (直连)</option>
+            <option value="jimeng-seedance-2.0-fast">即梦 Seedance 2.0 Fast (直连)</option>
             <option value="seedance-2.0-fast">速推 Seedance 2.0 (测试用)</option>
             <option value="sora-2.0">速推 Sora 2.0</option>
             <option value="bltcy-sora-2">柏拉图中转 Sora 2</option>
@@ -1012,16 +1243,52 @@ const ProjectSettingsForm: React.FC<{
 const GlobalSettingsModal: React.FC<{
   settings: GlobalSettings,
   onSave: (s: GlobalSettings) => void,
-  onClose: () => void
-}> = ({ settings, onSave, onClose }) => {
+  onClose: () => void,
+  defaultProjectType?: ProjectType
+}> = ({ settings, onSave, onClose, defaultProjectType }) => {
+  const DEFAULT_PROJECT_TYPE_KEYS = new Set(['REAL_PERSON_COMMENTARY', 'COMMENTARY_2D', 'COMMENTARY_3D', 'PREMIUM_2D', 'PREMIUM_3D']);
+
   const [localSettings, setLocalSettings] = useState(settings);
-  const [activeTab, setActiveTab] = useState<ProjectType>('REAL_PERSON_COMMENTARY');
+  const [activeTab, setActiveTab] = useState<string>(defaultProjectType || 'REAL_PERSON_COMMENTARY');
   const [jianyingPathDisplay, setJianyingPathDisplay] = useState<string>(settings.jianyingExportPath || '未设置');
+  const [seedanceSessions, setSeedanceSessions] = useState<SeedanceSession[]>([]);
+  const [seedanceSessionIdInput, setSeedanceSessionIdInput] = useState('');
+  const [seedanceSessionNameInput, setSeedanceSessionNameInput] = useState('');
+  const [editingSeedanceSessionId, setEditingSeedanceSessionId] = useState<string | null>(null);
+  const [editingSeedanceSessionValue, setEditingSeedanceSessionValue] = useState('');
+  const [seedanceLoading, setSeedanceLoading] = useState(false);
+
+  // Custom type management
+  const [showAddTypeModal, setShowAddTypeModal] = useState(false);
+  const [newTypeLabel, setNewTypeLabel] = useState('');
+  const [copyFromType, setCopyFromType] = useState('REAL_PERSON_COMMENTARY');
+  const [editingTypeKey, setEditingTypeKey] = useState<string | null>(null);
+  const [editingTypeLabel, setEditingTypeLabel] = useState('');
 
   useEffect(() => {
     setLocalSettings(settings);
     setJianyingPathDisplay(settings.jianyingExportPath || '未设置');
   }, [settings]);
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const loadSeedanceSessions = async () => {
+      try {
+        const sessions = await apiService.getSeedanceSessionsStatus();
+        setSeedanceSessions(Array.isArray(sessions) ? sessions : []);
+      } catch (error) {
+        console.error('加载 Seedance 会话状态失败:', error);
+      }
+    };
+
+    loadSeedanceSessions();
+    timer = setInterval(loadSeedanceSessions, 5000);
+
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, []);
 
   const updatePrompt = (field: keyof ProjectTypeInstruction, value: string) => {
       console.log(`📝 更新提示词 [${activeTab}] ${field}:`, value.substring(0, 50) + '...');
@@ -1061,6 +1328,209 @@ const GlobalSettingsModal: React.FC<{
     onClose();
   };
 
+  const refreshSeedanceSessions = async () => {
+    const sessions = await apiService.getSeedanceSessionsStatus();
+    setSeedanceSessions(Array.isArray(sessions) ? sessions : []);
+  };
+
+  const handleAddSeedanceSession = async () => {
+    if (!seedanceSessionIdInput.trim()) {
+      alert('请输入 Session ID');
+      return;
+    }
+
+    try {
+      setSeedanceLoading(true);
+      await apiService.addSeedanceSession(seedanceSessionIdInput.trim(), seedanceSessionNameInput.trim() || `账号${seedanceSessions.length + 1}`);
+      await apiService.syncSeedanceSessions();
+      await refreshSeedanceSessions();
+      setSeedanceSessionIdInput('');
+      setSeedanceSessionNameInput('');
+    } catch (error) {
+      alert('添加 Seedance Session 失败：' + (error as Error).message);
+    } finally {
+      setSeedanceLoading(false);
+    }
+  };
+
+  const handleDeleteSeedanceSession = async (id: string) => {
+    try {
+      setSeedanceLoading(true);
+      await apiService.deleteSeedanceSession(id);
+      await apiService.syncSeedanceSessions();
+      await refreshSeedanceSessions();
+    } catch (error) {
+      alert('删除 Seedance Session 失败：' + (error as Error).message);
+    } finally {
+      setSeedanceLoading(false);
+    }
+  };
+
+  const handleToggleSeedanceSession = async (session: SeedanceSession) => {
+    try {
+      setSeedanceLoading(true);
+      await apiService.updateSeedanceSession(session.id, {
+        status: session.status === 'disabled' ? 'active' : 'disabled'
+      });
+      await apiService.syncSeedanceSessions();
+      await refreshSeedanceSessions();
+    } catch (error) {
+      alert('更新 Seedance Session 状态失败：' + (error as Error).message);
+    } finally {
+      setSeedanceLoading(false);
+    }
+  };
+
+  const handleQuerySeedanceCredits = async (id: string) => {
+    try {
+      setSeedanceLoading(true);
+      await apiService.querySeedanceSessionCredits(id);
+      await refreshSeedanceSessions();
+    } catch (error) {
+      alert('查询积分失败：' + (error as Error).message);
+    } finally {
+      setSeedanceLoading(false);
+    }
+  };
+
+  const handleStartEditSeedanceSessionId = (session: SeedanceSession) => {
+    setEditingSeedanceSessionId(session.id);
+    setEditingSeedanceSessionValue('');
+  };
+
+  const handleSaveSeedanceSessionId = async (session: SeedanceSession) => {
+    if (!editingSeedanceSessionValue.trim()) {
+      alert('请输入新的 Session ID');
+      return;
+    }
+
+    try {
+      setSeedanceLoading(true);
+      await apiService.updateSeedanceSession(session.id, {
+        sessionId: editingSeedanceSessionValue.trim()
+      });
+      await apiService.syncSeedanceSessions();
+      await refreshSeedanceSessions();
+      setEditingSeedanceSessionId(null);
+      setEditingSeedanceSessionValue('');
+    } catch (error) {
+      alert('更新 Session ID 失败：' + (error as Error).message);
+    } finally {
+      setSeedanceLoading(false);
+    }
+  };
+
+  const handleCancelEditSeedanceSessionId = () => {
+    setEditingSeedanceSessionId(null);
+    setEditingSeedanceSessionValue('');
+  };
+
+  const getSeedanceStatusLabel = (status: SeedanceSession['status']) => {
+    if (status === 'active') return '可用';
+    if (status === 'expired') return '过期';
+    if (status === 'insufficient') return '积分不足';
+    return '禁用';
+  };
+
+  const getSeedanceStatusClass = (status: SeedanceSession['status']) => {
+    if (status === 'active') return 'bg-green-500/15 text-green-300 border-green-500/30';
+    if (status === 'expired') return 'bg-red-500/15 text-red-300 border-red-500/30';
+    if (status === 'insufficient') return 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30';
+    return 'bg-gray-500/15 text-gray-300 border-gray-500/30';
+  };
+
+  const handleAddCustomType = () => {
+    if (!newTypeLabel.trim()) {
+      alert('请输入项目类型名称');
+      return;
+    }
+
+    // Generate unique key
+    const newTypeKey = `CUSTOM_${Date.now()}`;
+
+    // Copy prompts from selected type
+    const sourcePrompts = localSettings.projectTypePrompts[copyFromType];
+    if (!sourcePrompts) {
+      alert('复制源类型失败');
+      return;
+    }
+
+    setLocalSettings(prev => ({
+      ...prev,
+      projectTypePrompts: {
+        ...prev.projectTypePrompts,
+        [newTypeKey]: { ...sourcePrompts }
+      },
+      projectTypeLabels: {
+        ...prev.projectTypeLabels,
+        [newTypeKey]: newTypeLabel.trim()
+      }
+    }));
+
+    setActiveTab(newTypeKey);
+    setShowAddTypeModal(false);
+    setNewTypeLabel('');
+    setCopyFromType('REAL_PERSON_COMMENTARY');
+  };
+
+  const handleDeleteCustomType = (typeKey: string) => {
+    if (DEFAULT_PROJECT_TYPE_KEYS.has(typeKey)) {
+      alert('无法删除内置项目类型');
+      return;
+    }
+
+    if (!confirm(`确认要删除项目类型 "${getProjectTypeLabel(typeKey, localSettings.projectTypeLabels)}" 吗？`)) {
+      return;
+    }
+
+    setLocalSettings(prev => {
+      const newPrompts = { ...prev.projectTypePrompts };
+      const newLabels = { ...prev.projectTypeLabels };
+      delete newPrompts[typeKey];
+      delete newLabels[typeKey];
+
+      return {
+        ...prev,
+        projectTypePrompts: newPrompts,
+        projectTypeLabels: newLabels
+      };
+    });
+
+    // Switch to first default type if current tab was deleted
+    if (activeTab === typeKey) {
+      setActiveTab('REAL_PERSON_COMMENTARY');
+    }
+  };
+
+  const handleRenameCustomType = (typeKey: string) => {
+    if (DEFAULT_PROJECT_TYPE_KEYS.has(typeKey)) {
+      alert('无法重命名内置项目类型');
+      return;
+    }
+
+    setEditingTypeKey(typeKey);
+    setEditingTypeLabel(localSettings.projectTypeLabels?.[typeKey] || typeKey);
+  };
+
+  const handleSaveCustomTypeLabel = () => {
+    if (!editingTypeKey || !editingTypeLabel.trim()) {
+      setEditingTypeKey(null);
+      setEditingTypeLabel('');
+      return;
+    }
+
+    setLocalSettings(prev => ({
+      ...prev,
+      projectTypeLabels: {
+        ...prev.projectTypeLabels,
+        [editingTypeKey]: editingTypeLabel.trim()
+      }
+    }));
+
+    setEditingTypeKey(null);
+    setEditingTypeLabel('');
+  };
+
   return (
     <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
       <div className="bg-gray-800 rounded-2xl w-full max-w-2xl border border-gray-700 shadow-2xl flex flex-col max-h-[90vh]">
@@ -1084,6 +1554,7 @@ const GlobalSettingsModal: React.FC<{
               className="w-full bg-gray-900 border border-gray-600 rounded p-3 text-white focus:border-green-500 focus:outline-none"
             >
               <option value="doubao-seed-2-0-pro-260215">豆包 Seed 2.0 Pro (推荐 - 火山引擎)</option>
+              <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (Univibe 中转)</option>
               <option value="grsai-gemini-3.1-pro">Grsai 中转 Gemini 3.1 Pro</option>
               <option value="gemini-3-flash-preview">Gemini 3 Flash (快速)</option>
               <option value="gemini-3-pro-preview">Gemini 3 Pro (高推理 - 较慢)</option>
@@ -1202,26 +1673,258 @@ const GlobalSettingsModal: React.FC<{
 
           <div className="w-full h-px bg-gray-700"></div>
 
+          <section>
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <h3 className="text-md font-bold text-white">即梦 Seedance 2.0 会话管理</h3>
+                <p className="text-sm text-gray-400 mt-1">管理 Session ID、查看实时状态与积分余量。</p>
+              </div>
+              {seedanceLoading && <Loader2 size={16} className="animate-spin text-gray-400" />}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+              <input
+                type="text"
+                value={seedanceSessionIdInput}
+                onChange={(e) => setSeedanceSessionIdInput(e.target.value)}
+                className="md:col-span-2 bg-gray-900 border border-gray-600 rounded px-3 py-2 text-white text-sm focus:border-green-500 focus:outline-none"
+                placeholder="输入即梦 sessionid"
+              />
+              <input
+                type="text"
+                value={seedanceSessionNameInput}
+                onChange={(e) => setSeedanceSessionNameInput(e.target.value)}
+                className="bg-gray-900 border border-gray-600 rounded px-3 py-2 text-white text-sm focus:border-green-500 focus:outline-none"
+                placeholder="显示名称（可选）"
+              />
+            </div>
+            <div className="flex justify-end mb-4">
+              <button
+                onClick={handleAddSeedanceSession}
+                className="px-4 py-2 bg-green-600 rounded text-white hover:bg-green-500 text-sm"
+              >
+                添加 Session
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              {seedanceSessions.length === 0 && (
+                <div className="bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 text-sm text-gray-400">
+                  暂无 Seedance Session，请先添加。
+                </div>
+              )}
+              {seedanceSessions.map((session) => (
+                <div key={session.id} className="bg-gray-900 border border-gray-700 rounded-xl p-4">
+                  <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-white font-medium">{session.name}</span>
+                        <span className={`px-2 py-0.5 rounded-full text-xs border ${getSeedanceStatusClass(session.status)}`}>
+                          {getSeedanceStatusLabel(session.status)}
+                        </span>
+                      </div>
+                      {editingSeedanceSessionId === session.id ? (
+                        <div className="flex flex-col sm:flex-row gap-2">
+                          <input
+                            type="text"
+                            value={editingSeedanceSessionValue}
+                            onChange={(e) => setEditingSeedanceSessionValue(e.target.value)}
+                            className="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white text-sm focus:border-green-500 focus:outline-none"
+                            placeholder="输入新的 Session ID"
+                          />
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => handleSaveSeedanceSessionId(session)}
+                              className="px-3 py-1.5 rounded bg-green-600 hover:bg-green-500 text-white text-xs"
+                            >
+                              保存 ID
+                            </button>
+                            <button
+                              onClick={handleCancelEditSeedanceSessionId}
+                              className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-white text-xs"
+                            >
+                              取消
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
+                      <div className="text-xs text-gray-400 flex flex-wrap gap-x-4 gap-y-1">
+                        <span>并发 {session.currentTasks}/{session.maxConcurrent}</span>
+                        <span>成功 {session.successCount}</span>
+                        <span>失败 {session.failCount}</span>
+                        <span>总任务 {session.totalTasks}</span>
+                        <span>积分 {session.credits ?? '未知'}</span>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        onClick={() => handleQuerySeedanceCredits(session.id)}
+                        className="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-white text-xs"
+                      >
+                        查询积分
+                      </button>
+                      <button
+                        onClick={() => handleStartEditSeedanceSessionId(session)}
+                        className="px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs"
+                      >
+                        编辑 Session ID
+                      </button>
+                      <button
+                        onClick={() => handleToggleSeedanceSession(session)}
+                        className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-white text-xs"
+                      >
+                        {session.status === 'disabled' ? '启用' : '禁用'}
+                      </button>
+                      <button
+                        onClick={() => handleDeleteSeedanceSession(session.id)}
+                        className="px-3 py-1.5 rounded bg-red-600 hover:bg-red-500 text-white text-xs"
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <div className="w-full h-px bg-gray-700"></div>
+
           {/* System Instructions */}
           <section>
              <h3 className="text-md font-bold text-white mb-3">项目类型指令</h3>
              <p className="text-sm text-gray-400 mb-4">自定义每种项目类型使用的系统指令（提示词前缀）。</p>
              
              {/* Tabs */}
-             <div className="flex gap-2 overflow-x-auto pb-2 mb-2 custom-scrollbar">
-                {(Object.keys(localSettings.projectTypePrompts) as ProjectType[]).map(type => (
-                   <button
-                     key={type}
-                     onClick={() => setActiveTab(type)}
-                     className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition-colors border ${
-                        activeTab === type 
-                        ? 'bg-green-600 text-white border-green-500' 
-                        : 'bg-gray-700 text-gray-400 border-transparent hover:text-gray-200'
-                     }`}
-                   >
-                      {PROJECT_TYPE_LABELS[type]}
-                   </button>
-                ))}
+             <div className="flex flex-col gap-3 pb-2 mb-2">
+               <div className="flex gap-2 overflow-x-auto pb-2 custom-scrollbar flex-wrap">
+                  {(Object.keys(localSettings.projectTypePrompts) as string[]).map(type => {
+                    const isDefault = DEFAULT_PROJECT_TYPE_KEYS.has(type);
+                    const isEditing = editingTypeKey === type;
+                    const typeLabel = getProjectTypeLabel(type, localSettings.projectTypeLabels);
+
+                    return (
+                      <div key={type} className="flex items-center gap-1">
+                        {isEditing ? (
+                          <div className="flex gap-1">
+                            <input
+                              type="text"
+                              value={editingTypeLabel}
+                              onChange={(e) => setEditingTypeLabel(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') handleSaveCustomTypeLabel();
+                                if (e.key === 'Escape') { setEditingTypeKey(null); setEditingTypeLabel(''); }
+                              }}
+                              autoFocus
+                              className="px-2 py-1 rounded text-xs bg-gray-900 border border-gray-600 text-white focus:border-green-500 focus:outline-none"
+                            />
+                            <button
+                              onClick={handleSaveCustomTypeLabel}
+                              className="p-1.5 rounded bg-green-600 hover:bg-green-500 text-white"
+                            >
+                              <Check size={12} />
+                            </button>
+                            <button
+                              onClick={() => { setEditingTypeKey(null); setEditingTypeLabel(''); }}
+                              className="p-1.5 rounded bg-gray-700 hover:bg-gray-600 text-white"
+                            >
+                              <X size={12} />
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => setActiveTab(type)}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap transition-colors border ${
+                              activeTab === type
+                              ? 'bg-green-600 text-white border-green-500'
+                              : 'bg-gray-700 text-gray-400 border-transparent hover:text-gray-200'
+                            }`}
+                          >
+                            {typeLabel}
+                          </button>
+                        )}
+                        {!isDefault && !isEditing && (
+                          <div className="flex gap-1">
+                            <button
+                              onClick={() => handleRenameCustomType(type)}
+                              className="p-1.5 rounded bg-gray-700 hover:bg-gray-600 text-gray-300 hover:text-white transition"
+                              title="重命名"
+                            >
+                              <Edit2 size={12} />
+                            </button>
+                            <button
+                              onClick={() => handleDeleteCustomType(type)}
+                              className="p-1.5 rounded bg-red-600/20 hover:bg-red-600/40 text-red-300 hover:text-red-200 transition"
+                              title="删除"
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+               </div>
+
+               {/* Add custom type button */}
+               <button
+                 onClick={() => setShowAddTypeModal(true)}
+                 className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold bg-blue-600 hover:bg-blue-500 text-white border border-blue-500 transition-colors w-fit"
+               >
+                 <Plus size={14} />
+                 新增项目类型
+               </button>
+
+               {/* Add Type Modal */}
+               {showAddTypeModal && (
+                 <div className="bg-gray-900 border border-gray-600 rounded-lg p-4 space-y-3">
+                   <div>
+                     <label className="block text-xs font-bold text-white mb-1">类型名称</label>
+                     <input
+                       type="text"
+                       value={newTypeLabel}
+                       onChange={(e) => setNewTypeLabel(e.target.value)}
+                       placeholder="例如：科幻3D"
+                       className="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white text-sm focus:border-green-500 focus:outline-none"
+                       onKeyDown={(e) => {
+                         if (e.key === 'Enter') handleAddCustomType();
+                         if (e.key === 'Escape') setShowAddTypeModal(false);
+                       }}
+                     />
+                   </div>
+                   <div>
+                     <label className="block text-xs font-bold text-white mb-1">复制提示词来自</label>
+                     <select
+                       value={copyFromType}
+                       onChange={(e) => setCopyFromType(e.target.value)}
+                       className="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white text-sm focus:border-green-500 focus:outline-none"
+                     >
+                       {(Object.keys(localSettings.projectTypePrompts) as string[]).map(type => (
+                         <option key={type} value={type}>
+                           {getProjectTypeLabel(type, localSettings.projectTypeLabels)}
+                         </option>
+                       ))}
+                     </select>
+                   </div>
+                   <div className="flex gap-2">
+                     <button
+                       onClick={handleAddCustomType}
+                       className="flex-1 px-3 py-2 rounded bg-green-600 hover:bg-green-500 text-white text-sm font-bold transition"
+                     >
+                       创建
+                     </button>
+                     <button
+                       onClick={() => {
+                         setShowAddTypeModal(false);
+                         setNewTypeLabel('');
+                       }}
+                       className="flex-1 px-3 py-2 rounded bg-gray-700 hover:bg-gray-600 text-white text-sm font-bold transition"
+                     >
+                       取消
+                     </button>
+                   </div>
+                 </div>
+               )}
              </div>
              
              <div className="space-y-4">
@@ -1437,6 +2140,7 @@ const App: React.FC = () => {
   const [isOpeningProject, setIsOpeningProject] = useState(false);
   const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
   const [editingFrameId, setEditingFrameId] = useState<string | null>(null); // For FrameEditorModal
+  const [showFindReplace, setShowFindReplace] = useState(false); // For FindReplaceModal
   const [showFolderPrompt, setShowFolderPrompt] = useState(false); // For folder selection prompt
   const [previewFrameId, setPreviewFrameId] = useState<string | null>(null);
   const [previewFrameMode, setPreviewFrameMode] = useState<'image' | 'video'>('image');
@@ -1602,6 +2306,7 @@ const App: React.FC = () => {
           const loadedSettings = await apiService.getSettings();
           const supportedExtractionModels = [
             'doubao-seed-2-0-pro-260215',
+            'claude-sonnet-4-6',
             'grsai-gemini-3.1-pro',
             'gemini-3-flash-preview',
             'gemini-3-pro-preview',
@@ -1910,6 +2615,7 @@ const App: React.FC = () => {
   const normalizeGlobalSettingsFromServer = (loadedSettings: any): GlobalSettings => {
     const supportedExtractionModels = [
       'doubao-seed-2-0-pro-260215',
+      'claude-sonnet-4-6',
       'grsai-gemini-3.1-pro',
       'gemini-3-flash-preview',
       'gemini-3-pro-preview',
@@ -1920,21 +2626,47 @@ const App: React.FC = () => {
       ? loadedSettings.extractionModel
       : DEFAULT_GLOBAL_SETTINGS.extractionModel;
 
-    const projectTypePrompts = (loadedSettings?.projectTypePrompts || {}) as Partial<Record<ProjectType, Partial<ProjectTypeInstruction>>>;
+    const projectTypePrompts = (loadedSettings?.projectTypePrompts || {}) as Record<string, Partial<ProjectTypeInstruction>>;
 
-    const normalizedPrompts = {} as Record<ProjectType, ProjectTypeInstruction>;
-    (Object.keys(DEFAULT_GLOBAL_SETTINGS.projectTypePrompts) as ProjectType[]).forEach((projectType) => {
+    // Start with defaults for all prompts
+    const normalizedPrompts = {} as Record<string, ProjectTypeInstruction>;
+    (Object.keys(DEFAULT_GLOBAL_SETTINGS.projectTypePrompts) as string[]).forEach((projectType) => {
       const defaultPrompts = DEFAULT_GLOBAL_SETTINGS.projectTypePrompts[projectType];
       const currentPrompts = projectTypePrompts[projectType] || {};
       normalizedPrompts[projectType] = { ...defaultPrompts, ...currentPrompts } as ProjectTypeInstruction;
     });
 
+    // Preserve custom types from server
+    Object.keys(projectTypePrompts).forEach((projectType) => {
+      if (!normalizedPrompts[projectType]) {
+        // Custom type not in defaults, preserve it
+        normalizedPrompts[projectType] = projectTypePrompts[projectType] as ProjectTypeInstruction;
+      }
+    });
+
+    // Merge labels: start with defaults, then apply server labels
+    const mergedLabels = { ...DEFAULT_GLOBAL_SETTINGS.projectTypeLabels };
+    if (loadedSettings?.projectTypeLabels) {
+      Object.entries(loadedSettings.projectTypeLabels).forEach(([key, label]) => {
+        // Protect built-in label keys from being overwritten by server data
+        const DEFAULT_TYPE_KEYS = new Set(['REAL_PERSON_COMMENTARY', 'COMMENTARY_2D', 'COMMENTARY_3D', 'PREMIUM_2D', 'PREMIUM_3D']);
+        if (!DEFAULT_TYPE_KEYS.has(key) || !mergedLabels[key]) {
+          mergedLabels[key] = label as string;
+        }
+      });
+    }
+
     return {
       extractionModel,
       projectTypePrompts: normalizedPrompts,
+      projectTypeLabels: mergedLabels,
+      multiRefVideoModel: loadedSettings?.multiRefVideoModel,
       // 剪映路径从 .env.local 读取（所有客户端共享网络驱动器）
       jianyingExportPath: import.meta.env.VITE_JIANYING_EXPORT_PATH || '',
       jianyingExportPathFull: import.meta.env.VITE_JIANYING_EXPORT_PATH_FULL || '',
+      defaultImageDuration: loadedSettings?.defaultImageDuration,
+      placeholderColor: loadedSettings?.placeholderColor,
+      ttsSpeed: loadedSettings?.ttsSpeed,
     };
   };
 
@@ -2258,7 +2990,7 @@ const App: React.FC = () => {
 
     setIsPreprocessing(true);
     try {
-      const prompts = globalSettings.projectTypePrompts[currentProject.type];
+      const prompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
       const systemInstruction = `${prompts.characterExtraction}\n\n${prompts.sceneExtraction}`;
 
       // 截取前 8000 字用于资产提取
@@ -2728,11 +3460,10 @@ const App: React.FC = () => {
       if (selectedIds.length === 0) return;
 
       const projectId = currentProject.id;
-      const prefix = globalSettings.projectTypePrompts[currentProject.type].assetImagePrefix;
-      const scenePrefix = globalSettings.projectTypePrompts[currentProject.type].sceneImagePrefix || '';
+      const typePrompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
+      const prefix = typePrompts.assetImagePrefix;
+      const scenePrefix = typePrompts.sceneImagePrefix || '';
       const model = currentProject.settings.imageModel;
-      const isBananaProModel = isBananaProImageModel(model);
-      const isVolcengineModel = isVolcengineImageModel(model);
       const tasks = selectedIds.map(id => {
         let description = '';
         let prompt = '';
@@ -2771,71 +3502,31 @@ const App: React.FC = () => {
               newProjects[projIndex] = newProj;
               return newProjects;
             });
-            let imageUrl: string;
-            if (isBananaProModel) {
-              // 使用香蕉Pro服务
-              imageUrl = await generateImageWithBananaPro(
-                prompt,
-                '16:9',
-                [],
-                '2K',
-                (progress) => {
-                  // 更新进度
-                  setProjects(prevProjects => {
-                    const newProjects = [...prevProjects];
-                    const projIndex = newProjects.findIndex(p => p.id === projectId);
-                    if (projIndex === -1) return prevProjects;
+            let imageUrl = await generateAssetImageWithSelectedModel(
+              prompt,
+              model,
+              projectId,
+              (progress) => {
+                setProjects(prevProjects => {
+                  const newProjects = [...prevProjects];
+                  const projIndex = newProjects.findIndex(p => p.id === projectId);
+                  if (projIndex === -1) return prevProjects;
 
-                    const newProj = { ...newProjects[projIndex] };
-                    if (type === 'character') {
-                      newProj.characters = newProj.characters.map(c =>
-                        c.id === id ? { ...c, progress, error: undefined } : c
-                      );
-                    } else {
-                      newProj.scenes = newProj.scenes.map(s =>
-                        s.id === id ? { ...s, progress, error: undefined } : s
-                      );
-                    }
-                    newProjects[projIndex] = newProj;
-                    return newProjects;
-                  });
-                },
-                model
-              );
-            } else if (isVolcengineModel) {
-              // 使用火山引擎服务
-              imageUrl = await generateImageWithVolcengine(
-                prompt,
-                '16:9',
-                [],
-                '2K',
-                (progress) => {
-                  // 更新进度
-                  setProjects(prevProjects => {
-                    const newProjects = [...prevProjects];
-                    const projIndex = newProjects.findIndex(p => p.id === projectId);
-                    if (projIndex === -1) return prevProjects;
-
-                    const newProj = { ...newProjects[projIndex] };
-                    if (type === 'character') {
-                      newProj.characters = newProj.characters.map(c =>
-                        c.id === id ? { ...c, progress, error: undefined } : c
-                      );
-                    } else {
-                      newProj.scenes = newProj.scenes.map(s =>
-                        s.id === id ? { ...s, progress, error: undefined } : s
-                      );
-                    }
-                    newProjects[projIndex] = newProj;
-                    return newProjects;
-                  });
-                },
-                model
-              );
-            } else {
-              // 使用Gemini服务
-              imageUrl = await generateImageAsset(prompt, '16:9', model);
-            }
+                  const newProj = { ...newProjects[projIndex] };
+                  if (type === 'character') {
+                    newProj.characters = newProj.characters.map(c =>
+                      c.id === id ? { ...c, progress, error: undefined } : c
+                    );
+                  } else {
+                    newProj.scenes = newProj.scenes.map(s =>
+                      s.id === id ? { ...s, progress, error: undefined } : s
+                    );
+                  }
+                  newProjects[projIndex] = newProj;
+                  return newProjects;
+                });
+              }
+            );
 
             // 上传图片到服务端，避免 Base64 内嵌导致项目 JSON 过大
             imageUrl = await uploadImageIfBase64(imageUrl, `${type}_${id}_${Date.now()}`);
@@ -3114,7 +3805,8 @@ const App: React.FC = () => {
       if (!parentChar) return;
 
       const projectId = currentProject.id;
-      const prefix = globalSettings.projectTypePrompts[currentProject.type].assetImagePrefix;
+      const typePrompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
+      const prefix = typePrompts.assetImagePrefix;
       const prompt = buildVariantAssetPrompt(prefix, variant);
       const model = currentProject.settings.imageModel;
       const isBananaProModel = isBananaProImageModel(model);
@@ -3267,7 +3959,7 @@ const App: React.FC = () => {
 
     try {
       // 1. Get Settings for this Project Type
-      const prompts = globalSettings.projectTypePrompts[currentProject.type];
+      const prompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
       const model = globalSettings.extractionModel;
 
       if (model.startsWith('doubao')) {
@@ -3293,20 +3985,25 @@ const App: React.FC = () => {
 
       // 2. Extract Assets - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
+      const isClaudeModel = isClaudeChatModel(model);
       const isGrsaiModel = isGrsaiChatModel(model);
       const analyzeNovelScript = isVolcengineModel
         ? analyzeNovelScriptVolcengine
+        : isClaudeModel
+        ? analyzeNovelScriptWithClaude
         : isGrsaiModel
         ? analyzeNovelScriptWithGrsai
         : analyzeNovelScriptGemini;
       const resolvedModel = isGrsaiModel ? getGrsaiChatModelName(model) : model;
 
       Logger.logInfo('选择的服务', {
-        service: isVolcengineModel ? '火山引擎' : isGrsaiModel ? 'Grsai' : 'Gemini',
+        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : isGrsaiModel ? 'Grsai' : 'Gemini',
         model: resolvedModel
       });
 
-      const analysis = await analyzeNovelScript(currentEpisode.scriptContent, resolvedModel, systemInstruction);
+      const analysis = isClaudeModel
+        ? await analyzeNovelScriptWithClaude(currentEpisode.scriptContent, systemInstruction)
+        : await analyzeNovelScript(currentEpisode.scriptContent, resolvedModel, systemInstruction);
 
       Logger.logInfo('角色和场景提取完成', {
         charactersCount: analysis.characters.length,
@@ -3398,7 +4095,7 @@ const App: React.FC = () => {
 
     try {
       // 1. Get Settings for this Project Type
-      const prompts = globalSettings.projectTypePrompts[currentProject.type];
+      const prompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
       const model = globalSettings.extractionModel;
 
       if (model.startsWith('doubao')) {
@@ -3423,20 +4120,25 @@ const App: React.FC = () => {
 
       // 2. Extract Characters - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
+      const isClaudeModel = isClaudeChatModel(model);
       const isGrsaiModel = isGrsaiChatModel(model);
       const analyzeNovelScript = isVolcengineModel
         ? analyzeNovelScriptVolcengine
+        : isClaudeModel
+        ? analyzeNovelScriptWithClaude
         : isGrsaiModel
         ? analyzeNovelScriptWithGrsai
         : analyzeNovelScriptGemini;
       const resolvedModel = isGrsaiModel ? getGrsaiChatModelName(model) : model;
 
       Logger.logInfo('选择的服务', {
-        service: isVolcengineModel ? '火山引擎' : isGrsaiModel ? 'Grsai' : 'Gemini',
+        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : isGrsaiModel ? 'Grsai' : 'Gemini',
         model: resolvedModel
       });
 
-      const analysis = await analyzeNovelScript(currentEpisode.scriptContent, resolvedModel, systemInstruction);
+      const analysis = isClaudeModel
+        ? await analyzeNovelScriptWithClaude(currentEpisode.scriptContent, systemInstruction)
+        : await analyzeNovelScript(currentEpisode.scriptContent, resolvedModel, systemInstruction);
 
       Logger.logInfo('人物提取完成', {
         charactersCount: (analysis.characters ?? []).length,
@@ -3522,7 +4224,7 @@ const App: React.FC = () => {
 
     try {
       // 1. Get Settings for this Project Type
-      const prompts = globalSettings.projectTypePrompts[currentProject.type];
+      const prompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
       const model = globalSettings.extractionModel;
 
       if (model.startsWith('doubao')) {
@@ -3547,20 +4249,25 @@ const App: React.FC = () => {
 
       // 2. Extract Scenes - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
+      const isClaudeModel = isClaudeChatModel(model);
       const isGrsaiModel = isGrsaiChatModel(model);
       const analyzeNovelScript = isVolcengineModel
         ? analyzeNovelScriptVolcengine
+        : isClaudeModel
+        ? analyzeNovelScriptWithClaude
         : isGrsaiModel
         ? analyzeNovelScriptWithGrsai
         : analyzeNovelScriptGemini;
       const resolvedModel = isGrsaiModel ? getGrsaiChatModelName(model) : model;
 
       Logger.logInfo('选择的服务', {
-        service: isVolcengineModel ? '火山引擎' : isGrsaiModel ? 'Grsai' : 'Gemini',
+        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : isGrsaiModel ? 'Grsai' : 'Gemini',
         model: resolvedModel
       });
 
-      const analysis = await analyzeNovelScript(currentEpisode.scriptContent, resolvedModel, systemInstruction);
+      const analysis = isClaudeModel
+        ? await analyzeNovelScriptWithClaude(currentEpisode.scriptContent, systemInstruction)
+        : await analyzeNovelScript(currentEpisode.scriptContent, resolvedModel, systemInstruction);
 
       Logger.logInfo('场景提取完成', {
         scenesCount: (analysis.scenes ?? []).length
@@ -3622,7 +4329,7 @@ const App: React.FC = () => {
     setEpisodeProcessing(currentEpisode.id, true);
     try {
       // 1. Get Settings for this Project Type
-      const prompts = globalSettings.projectTypePrompts[currentProject.type];
+      const prompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
       const model = globalSettings.extractionModel;
 
       Logger.logInfo('使用的模型和提示词配置', {
@@ -3633,16 +4340,19 @@ const App: React.FC = () => {
 
       // 2. Breakdown Storyboard - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
+      const isClaudeModel = isClaudeChatModel(model);
       const isGrsaiModel = isGrsaiChatModel(model);
       const generateStoryboardBreakdown = isVolcengineModel
         ? generateStoryboardBreakdownVolcengine
+        : isClaudeModel
+        ? generateStoryboardBreakdownWithClaude
         : isGrsaiModel
         ? generateStoryboardBreakdownWithGrsai
         : generateStoryboardBreakdownGemini;
       const resolvedModel = isGrsaiModel ? getGrsaiChatModelName(model) : model;
 
       Logger.logInfo('选择的服务', {
-        service: isVolcengineModel ? '火山引擎' : isGrsaiModel ? 'Grsai' : 'Gemini',
+        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : isGrsaiModel ? 'Grsai' : 'Gemini',
         model: resolvedModel
       });
 
@@ -3686,7 +4396,9 @@ const App: React.FC = () => {
 候选场景列表（name）：\n${JSON.stringify(sceneChoices)}\n`;
 
       const storyboardSystemInstruction = `${prompts.storyboardBreakdown}\n\n${assetMatchingInstruction}`;
-      const breakdown = await generateStoryboardBreakdown(currentEpisode.scriptContent, resolvedModel, storyboardSystemInstruction);
+      const breakdown = isClaudeModel
+        ? await generateStoryboardBreakdownWithClaude(currentEpisode.scriptContent, storyboardSystemInstruction)
+        : await generateStoryboardBreakdown(currentEpisode.scriptContent, resolvedModel, storyboardSystemInstruction);
 
       Logger.logInfo('分镜分解完成', {
         framesCount: breakdown.frames.length
@@ -3700,6 +4412,14 @@ const App: React.FC = () => {
         const variantIds = (f.variantNames || [])
           .map(name => (currentProject.variants ?? []).find(v => v.name === name)?.id)
           .filter((id): id is string => !!id);
+
+        // 如果某角色已有变体被引用，则从 characterIds 中移除该角色，避免重复引用
+        const variantOwnerCharIds = new Set(
+          variantIds
+            .map(vid => (currentProject.variants ?? []).find(v => v.id === vid)?.characterId)
+            .filter((id): id is string => !!id)
+        );
+        const dedupedCharIds = charIds.filter(cid => !variantOwnerCharIds.has(cid));
 
         const sceneNames = (f.sceneNames ?? (f.sceneName ? [f.sceneName] : []));
         const sceneIds = sceneNames
@@ -3719,7 +4439,7 @@ const App: React.FC = () => {
           dialogue,
           originalText: f.originalText,
           references: {
-            characterIds: [...new Set(charIds)],
+            characterIds: [...new Set(dedupedCharIds)],
             variantIds: variantIds.length > 0 ? [...new Set(variantIds)] : undefined,
             sceneId: deduped[0],
             sceneIds: deduped.length > 0 ? deduped : undefined,
@@ -3763,8 +4483,9 @@ const App: React.FC = () => {
     if (!currentProject) return;
 
     const projectId = currentProject.id;
-    const prefix = globalSettings.projectTypePrompts[currentProject.type].assetImagePrefix;
-    const scenePrefix = globalSettings.projectTypePrompts[currentProject.type].sceneImagePrefix || '';
+    const typePrompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
+    const prefix = typePrompts.assetImagePrefix;
+    const scenePrefix = typePrompts.sceneImagePrefix || '';
     const prompt = type === 'character'
       ? (() => {
         const char = currentProject.characters.find(c => c.id === id);
@@ -3772,12 +4493,6 @@ const App: React.FC = () => {
       })()
       : scenePrefix ? `${scenePrefix}, ${description}` : description;
     const model = currentProject.settings.imageModel;
-    const isBananaProModel = isBananaProImageModel(model);
-    const isVolcengineModel = isVolcengineImageModel(model);
-    const isXskillModel = isXskillNanoBanana2Model(model);
-    const isJarvisModel = isJarvisNanoBanana2Model(model);
-    const isBltcyModel = isBltcyBanana2Model(model);
-    const isBltcyNanoBananaHd = isBltcyNanoBananaHdModel(model);
     const task = {
       id: uuidv4(),
       type: type as 'character' | 'scene',
@@ -3802,209 +4517,31 @@ const App: React.FC = () => {
           newProjects[projIndex] = newProj;
           return newProjects;
         });
-        let imageUrl: string;
-        if (isBananaProModel) {
-          // 使用香蕉Pro服务
-          imageUrl = await generateImageWithBananaPro(
-            prompt,
-            '16:9',
-            [],
-            '2K',
-            (progress) => {
-              // 更新进度
-              setProjects(prevProjects => {
-                const newProjects = [...prevProjects];
-                const projIndex = newProjects.findIndex(p => p.id === projectId);
-                if (projIndex === -1) return prevProjects;
+        let imageUrl = await generateAssetImageWithSelectedModel(
+          prompt,
+          model,
+          projectId,
+          (progress) => {
+            setProjects(prevProjects => {
+              const newProjects = [...prevProjects];
+              const projIndex = newProjects.findIndex(p => p.id === projectId);
+              if (projIndex === -1) return prevProjects;
 
-                const newProj = { ...newProjects[projIndex] };
-                if (type === 'character') {
-                  newProj.characters = newProj.characters.map(c =>
-                    c.id === id ? { ...c, progress, error: undefined } : c
-                  );
-                } else {
-                  newProj.scenes = newProj.scenes.map(s =>
-                    s.id === id ? { ...s, progress, error: undefined } : s
-                  );
-                }
-                newProjects[projIndex] = newProj;
-                return newProjects;
-              });
-            },
-            model
-          );
-        } else if (isVolcengineModel) {
-          imageUrl = await generateImageWithVolcengine(
-            prompt,
-            '16:9',
-            [],
-            '2K',
-            (progress) => {
-              setProjects(prevProjects => {
-                const newProjects = [...prevProjects];
-                const projIndex = newProjects.findIndex(p => p.id === projectId);
-                if (projIndex === -1) return prevProjects;
-
-                const newProj = { ...newProjects[projIndex] };
-                if (type === 'character') {
-                  newProj.characters = newProj.characters.map(c =>
-                    c.id === id ? { ...c, progress, error: undefined } : c
-                  );
-                } else {
-                  newProj.scenes = newProj.scenes.map(s =>
-                    s.id === id ? { ...s, progress, error: undefined } : s
-                  );
-                }
-                newProjects[projIndex] = newProj;
-                return newProjects;
-              });
-            },
-            model
-          );
-        } else if (isXskillModel) {
-          // 使用速推nano banana2服务
-          imageUrl = await generateImageWithXskillNanoBanana2(
-            prompt,
-            '16:9',
-            [],
-            projectId,
-            (progress) => {
-              setProjects(prevProjects => {
-                const newProjects = [...prevProjects];
-                const projIndex = newProjects.findIndex(p => p.id === projectId);
-                if (projIndex === -1) return prevProjects;
-
-                const newProj = { ...newProjects[projIndex] };
-                if (type === 'character') {
-                  newProj.characters = newProj.characters.map(c =>
-                    c.id === id ? { ...c, progress, error: undefined } : c
-                  );
-                } else {
-                  newProj.scenes = newProj.scenes.map(s =>
-                    s.id === id ? { ...s, progress, error: undefined } : s
-                  );
-                }
-                newProjects[projIndex] = newProj;
-                return newProjects;
-              });
-            }
-          );
-        } else if (isJarvisModel) {
-          // 使用贾维斯中转nano banana2服务
-          imageUrl = await generateImageWithJarvisNanoBanana2(
-            prompt,
-            '16:9',
-            [],
-            projectId,
-            (progress) => {
-              setProjects(prevProjects => {
-                const newProjects = [...prevProjects];
-                const projIndex = newProjects.findIndex(p => p.id === projectId);
-                if (projIndex === -1) return prevProjects;
-
-                const newProj = { ...newProjects[projIndex] };
-                if (type === 'character') {
-                  newProj.characters = newProj.characters.map(c =>
-                    c.id === id ? { ...c, progress, error: undefined } : c
-                  );
-                } else {
-                  newProj.scenes = newProj.scenes.map(s =>
-                    s.id === id ? { ...s, progress, error: undefined } : s
-                  );
-                }
-                newProjects[projIndex] = newProj;
-                return newProjects;
-              });
-            }
-          );
-        } else if (isBltcyModel) {
-          // 使用柏拉图 One-API banana2 (2K)
-          imageUrl = await generateImageWithBltcyBanana2(
-            prompt,
-            '16:9',
-            [],
-            projectId,
-            (progress) => {
-              setProjects(prevProjects => {
-                const newProjects = [...prevProjects];
-                const projIndex = newProjects.findIndex(p => p.id === projectId);
-                if (projIndex === -1) return prevProjects;
-
-                const newProj = { ...newProjects[projIndex] };
-                if (type === 'character') {
-                  newProj.characters = newProj.characters.map(c =>
-                    c.id === id ? { ...c, progress, error: undefined } : c
-                  );
-                } else {
-                  newProj.scenes = newProj.scenes.map(s =>
-                    s.id === id ? { ...s, progress, error: undefined } : s
-                  );
-                }
-                newProjects[projIndex] = newProj;
-                return newProjects;
-              });
-            }
-          );
-        } else if (isBltcyNanoBananaHd) {
-          // 使用柏拉图中转 nano banana (HD)
-          imageUrl = await generateImageWithBltcyNanoBananaHd(
-            prompt,
-            '16:9',
-            [],
-            projectId,
-            (progress) => {
-              setProjects(prevProjects => {
-                const newProjects = [...prevProjects];
-                const projIndex = newProjects.findIndex(p => p.id === projectId);
-                if (projIndex === -1) return prevProjects;
-
-                const newProj = { ...newProjects[projIndex] };
-                if (type === 'character') {
-                  newProj.characters = newProj.characters.map(c =>
-                    c.id === id ? { ...c, progress, error: undefined } : c
-                  );
-                } else {
-                  newProj.scenes = newProj.scenes.map(s =>
-                    s.id === id ? { ...s, progress, error: undefined } : s
-                  );
-                }
-                newProjects[projIndex] = newProj;
-                return newProjects;
-              });
-            }
-          );
-        } else if (isBltcyNanoBananaProModel(model)) {
-          // 使用柏拉图中转 nano banana pro
-          imageUrl = await generateImageWithBltcyNanoBananaPro(
-            prompt,
-            '16:9',
-            [],
-            projectId,
-            (progress) => {
-              setProjects(prevProjects => {
-                const newProjects = [...prevProjects];
-                const projIndex = newProjects.findIndex(p => p.id === projectId);
-                if (projIndex === -1) return prevProjects;
-
-                const newProj = { ...newProjects[projIndex] };
-                if (type === 'character') {
-                  newProj.characters = newProj.characters.map(c =>
-                    c.id === id ? { ...c, progress, error: undefined } : c
-                  );
-                } else {
-                  newProj.scenes = newProj.scenes.map(s =>
-                    s.id === id ? { ...s, progress, error: undefined } : s
-                  );
-                }
-                newProjects[projIndex] = newProj;
-                return newProjects;
-              });
-            }
-          );
-        } else {
-          // 使用Gemini服务
-          imageUrl = await generateImageAsset(prompt, '16:9', model);
-        }
+              const newProj = { ...newProjects[projIndex] };
+              if (type === 'character') {
+                newProj.characters = newProj.characters.map(c =>
+                  c.id === id ? { ...c, progress, error: undefined } : c
+                );
+              } else {
+                newProj.scenes = newProj.scenes.map(s =>
+                  s.id === id ? { ...s, progress, error: undefined } : s
+                );
+              }
+              newProjects[projIndex] = newProj;
+              return newProjects;
+            });
+          }
+        );
 
         // 上传图片到服务端，避免 Base64 内嵌导致项目 JSON 过大
         imageUrl = await uploadImageIfBase64(imageUrl, `${type}_${id}_${Date.now()}`);
@@ -4063,7 +4600,8 @@ const App: React.FC = () => {
 
     const projectId = currentProject.id;
     const episodeId = currentEpisode.id;
-    const prefix = globalSettings.projectTypePrompts[currentProject.type].storyboardImagePrefix;
+    const typePrompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
+    const prefix = typePrompts.storyboardImagePrefix;
     const aspectRatio = currentProject.settings.aspectRatio || '16:9';
     const model = currentProject.settings.storyboardImageModel ?? currentProject.settings.imageModel;
     const isBananaProModel = isBananaProImageModel(model);
@@ -4503,7 +5041,7 @@ const App: React.FC = () => {
     const aspectRatio = currentProject.settings.aspectRatio;
     const videoDuration = currentProject.settings.videoDuration || 5;
     const multiRefMode = currentProject.settings.multiRefVideoMode ?? false;
-    const prompts = globalSettings.projectTypePrompts[currentProject.type];
+    const prompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
     const prefix = prompts.videoGenerationPrefix;
 
     // 在入队时捕获帧数据（避免 execute 内读取过期闭包）
@@ -4511,33 +5049,82 @@ const App: React.FC = () => {
     if (!frame) return;
     if (!multiRefMode && !frame.imageUrl) return;
 
-    // 多参考模式：提前组装参考图列表和提示词后缀
+    // 多参考模式：提前组装参考图列表和 @N 映射声明
     let multiRefImages: string[] = [];
-    let multiRefPromptSuffix = '';
+    let multiRefMapping = '';
     let multiRefFullPrompt = '';
 
     if (multiRefMode) {
       const multiRefPrefix = (prompts.multiRefVideoGenerationPrefix || '').trim() || prefix;
       let imgIndex = 1;
+
+      const multiRefDebug = {
+        frameId,
+        frameIndex: frame.index,
+        characterIds: [...frame.references.characterIds],
+        variantIds: [...(frame.references.variantIds ?? [])],
+        sceneIds: [...(frame.references.sceneIds ?? (frame.references.sceneId ? [frame.references.sceneId] : []))],
+        collected: [] as Array<{ type: 'character' | 'variant' | 'scene'; id: string; name: string; hasImage: boolean }>,
+      };
+
       frame.references.characterIds.forEach(charId => {
         const char = currentProject.characters.find(c => c.id === charId);
+        multiRefDebug.collected.push({
+          type: 'character',
+          id: charId,
+          name: char?.name || '(未找到角色)',
+          hasImage: !!char?.imageUrl,
+        });
         if (char?.imageUrl) {
           multiRefImages.push(char.imageUrl);
-          multiRefPromptSuffix += `【${char.name}：如图${imgIndex}】`;
+          multiRefMapping += `【@${imgIndex}为${char.name}】`;
           imgIndex++;
         }
       });
+
+      for (const variantId of (frame.references.variantIds ?? [])) {
+        const variant = (currentProject.variants ?? []).find(v => v.id === variantId);
+        multiRefDebug.collected.push({
+          type: 'variant',
+          id: variantId,
+          name: variant?.name || '(未找到变体)',
+          hasImage: !!variant?.imageUrl,
+        });
+        if (variant?.imageUrl) {
+          multiRefImages.push(variant.imageUrl);
+          // 标注所属角色，如【@2为林黛玉的宫装造型】
+          const parentChar = currentProject.characters.find(c => c.id === variant.characterId);
+          const variantLabel = parentChar ? `${parentChar.name}的${variant.name}` : variant.name;
+          multiRefMapping += `【@${imgIndex}为${variantLabel}】`;
+          imgIndex++;
+        }
+      }
+
       const effectiveSceneIds = frame.references.sceneIds
         ?? (frame.references.sceneId ? [frame.references.sceneId] : []);
       for (const sceneId of effectiveSceneIds) {
         const scene = currentProject.scenes.find(s => s.id === sceneId);
+        multiRefDebug.collected.push({
+          type: 'scene',
+          id: sceneId,
+          name: scene?.name || '(未找到场景)',
+          hasImage: !!scene?.imageUrl,
+        });
         if (scene?.imageUrl) {
           multiRefImages.push(scene.imageUrl);
-          multiRefPromptSuffix += `【${scene.name}：如图${imgIndex}】`;
+          multiRefMapping += `【@${imgIndex}为${scene.name}】`;
           imgIndex++;
         }
       }
-      multiRefFullPrompt = `${multiRefPrefix} ${frame.videoPrompt}${multiRefPromptSuffix ? ' ' + multiRefPromptSuffix : ''}`;
+
+      // @N 映射声明放在 videoPrompt 前面
+      multiRefFullPrompt = `${multiRefPrefix} ${multiRefMapping} ${frame.videoPrompt}`.trim();
+
+      console.log('[多参考视频] 收集结果', {
+        ...multiRefDebug,
+        finalImageCount: multiRefImages.length,
+        finalPrompt: multiRefFullPrompt,
+      });
     }
 
     const fullVideoPrompt = `${prefix} ${frame.videoPrompt}`;
@@ -4573,9 +5160,15 @@ const App: React.FC = () => {
         let videoUrl: string;
 
         if (multiRefMode) {
-          videoUrl = await generateVideoWithSeedanceMultiRef(
+          const jimengMultiRefModel = multiRefModel === 'seedance_2.0' ? 'seedance-2.0' : 'seedance-2.0-fast';
+          videoUrl = await generateVideoWithJimengSeedanceMultiRef(
             multiRefImages.length > 0 ? multiRefImages : (capturedImageUrl ? [capturedImageUrl] : []),
-            multiRefFullPrompt, aspectRatio, videoDuration, projectId, multiRefModel, onProgress
+            multiRefFullPrompt,
+            aspectRatio,
+            videoDuration,
+            projectId,
+            onProgress,
+            jimengMultiRefModel
           );
         } else if (model === 'kling-v3-omni') {
           videoUrl = await generateVideoWithKlingOmni(
@@ -4600,6 +5193,11 @@ const App: React.FC = () => {
               throw volcErr;
             }
           }
+        } else if (model.startsWith('jimeng-seedance')) {
+          const jimengModel = model === 'jimeng-seedance-2.0' ? 'seedance-2.0' : 'seedance-2.0-fast';
+          videoUrl = await generateVideoWithJimengSeedance(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, jimengModel, frame.githubImageUrl
+          );
         } else if (model.startsWith('seedance-2')) {
           videoUrl = await generateVideoWithSeedance(
             capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress
@@ -4917,7 +5515,7 @@ const App: React.FC = () => {
                   <h3 className="text-xl font-semibold mb-1 truncate">{project.name}</h3>
                   <div className="flex justify-between items-center mt-2">
                      <div className="flex flex-col">
-                        <span className="text-xs bg-gray-700 px-2 py-0.5 rounded text-gray-300 w-fit mb-1">{PROJECT_TYPE_LABELS[project.type]}</span>
+                        <span className="text-xs bg-gray-700 px-2 py-0.5 rounded text-gray-300 w-fit mb-1">{getProjectTypeLabel(project.type, globalSettings.projectTypeLabels)}</span>
                         <p className="text-sm text-gray-500">编辑于: {new Date(project.updatedAt).toLocaleDateString()}</p>
                      </div>
                      <div className="flex items-center gap-2 text-xs text-gray-400">
@@ -4963,6 +5561,7 @@ const App: React.FC = () => {
         {showGlobalSettingsModal && (
             <GlobalSettingsModal
                 settings={globalSettings}
+                defaultProjectType={currentProject?.type}
                 onSave={async (s) => {
                   try {
                     await apiService.updateSettings(s);
@@ -5005,7 +5604,7 @@ const App: React.FC = () => {
                         <div className="min-w-0">
                           <div className="text-white font-medium truncate">{project.name}</div>
                           <div className="text-xs text-gray-500 mt-1 flex items-center gap-2">
-                            <span className="bg-gray-700 px-2 py-0.5 rounded">{PROJECT_TYPE_LABELS[project.type]}</span>
+                            <span className="bg-gray-700 px-2 py-0.5 rounded">{getProjectTypeLabel(project.type, globalSettings.projectTypeLabels)}</span>
                             <span>删除时间: {project.deletedAt ? new Date(project.deletedAt).toLocaleString() : '-'}</span>
                           </div>
                         </div>
@@ -5060,7 +5659,7 @@ const App: React.FC = () => {
                          <div>
                             <label className="block text-sm font-medium text-gray-400 mb-2">项目类型</label>
                             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                               {(['REAL_PERSON_COMMENTARY', 'COMMENTARY_2D', 'COMMENTARY_3D', 'PREMIUM_2D', 'PREMIUM_3D'] as ProjectType[]).map(type => (
+                               {Object.keys(globalSettings.projectTypePrompts).map(type => (
                                  <button
                                    key={type}
                                    onClick={() => setNewProjectData({...newProjectData, type})}
@@ -5070,7 +5669,7 @@ const App: React.FC = () => {
                                      : 'bg-gray-700 border-transparent text-gray-400 hover:bg-gray-600'
                                    }`}
                                  >
-                                   {PROJECT_TYPE_LABELS[type]}
+                                              {getProjectTypeLabel(type, globalSettings.projectTypeLabels)}
                                  </button>
                                ))}
                             </div>
@@ -5150,6 +5749,8 @@ const App: React.FC = () => {
                               >
                                 <option value="doubao-seedance-1-5-pro-251215">豆包 Seedance 1.5 Pro (推荐)</option>
                                 <option value="kling-v3-omni">可灵 Kling v3 Omni</option>
+                                <option value="jimeng-seedance-2.0">即梦 Seedance 2.0 Pro (直连)</option>
+                                <option value="jimeng-seedance-2.0-fast">即梦 Seedance 2.0 Fast (直连)</option>
                                 <option value="seedance-2.0-fast">速推 Seedance 2.0 (测试用)</option>
                                 <option value="sora-2.0">速推 Sora 2.0</option>
                                 <option value="bltcy-sora-2">柏拉图中转 Sora 2</option>
@@ -5218,7 +5819,7 @@ const App: React.FC = () => {
               <div>
                 <h1 className="text-lg font-bold text-white flex items-center gap-2">
                   {currentProject.name}
-                  <span className="px-2 py-0.5 rounded-full bg-gray-800 text-[10px] text-gray-400 border border-gray-700">{PROJECT_TYPE_LABELS[currentProject.type]}</span>
+                  <span className="px-2 py-0.5 rounded-full bg-gray-800 text-[10px] text-gray-400 border border-gray-700">{getProjectTypeLabel(currentProject.type, globalSettings.projectTypeLabels)}</span>
                 </h1>
                 <p className="text-xs text-gray-500">项目概览</p>
               </div>
@@ -5505,6 +6106,7 @@ const App: React.FC = () => {
         {showGlobalSettingsModal && (
           <GlobalSettingsModal
             settings={globalSettings}
+            defaultProjectType={currentProject?.type}
             onSave={async (s) => {
               try {
                 await apiService.updateSettings(s);
@@ -5691,6 +6293,15 @@ const App: React.FC = () => {
                         </button>
                     </div>
 
+                    {char.error && (
+                      <div className="absolute top-2 right-12 group/error z-20" onClick={e => e.stopPropagation()}>
+                        <AlertCircle className="w-5 h-5 text-red-500 drop-shadow-lg" />
+                        <div className="absolute right-0 top-6 w-48 bg-red-900/95 border border-red-700 rounded-lg p-2 text-xs text-red-100 opacity-0 group-hover/error:opacity-100 transition-opacity pointer-events-none shadow-lg">
+                          {char.error}
+                        </div>
+                      </div>
+                    )}
+
                     <div className="aspect-square bg-gray-900 rounded-md overflow-hidden relative group/img">
                       {char.imageUrl ? (
                         <img src={char.imageUrl} alt={char.name} className="w-full h-full object-cover" />
@@ -5705,16 +6316,6 @@ const App: React.FC = () => {
                           <span className="text-xs text-blue-300 font-medium">
                             生成中 {Math.round(char.progress)}%
                           </span>
-                        </div>
-                      )}
-
-                      {/* 错误显示 */}
-                      {char.error && (
-                        <div className="absolute top-2 right-2 group/error">
-                          <AlertCircle className="w-5 h-5 text-red-500" />
-                          <div className="absolute right-0 top-6 w-48 bg-red-900/95 border border-red-700 rounded-lg p-2 text-xs text-red-100 opacity-0 group-hover/error:opacity-100 transition-opacity pointer-events-none z-20 shadow-lg">
-                            {char.error}
-                          </div>
                         </div>
                       )}
 
@@ -5816,6 +6417,15 @@ const App: React.FC = () => {
                         </button>
                     </div>
 
+                    {variant.error && (
+                      <div className="absolute top-2 right-12 group/error z-20" onClick={e => e.stopPropagation()}>
+                        <AlertCircle className="w-5 h-5 text-red-500 drop-shadow-lg" />
+                        <div className="absolute right-0 top-6 w-48 bg-red-900/95 border border-red-700 rounded-lg p-2 text-xs text-red-100 opacity-0 group-hover/error:opacity-100 transition-opacity pointer-events-none shadow-lg">
+                          {variant.error}
+                        </div>
+                      </div>
+                    )}
+
                     <div className="aspect-square bg-gray-900 rounded-md overflow-hidden relative group/img">
                       {variant.imageUrl ? (
                         <img src={variant.imageUrl} alt={variant.name} className="w-full h-full object-cover" />
@@ -5827,15 +6437,6 @@ const App: React.FC = () => {
                         <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center gap-2">
                           <Loader2 className="animate-spin text-purple-500 w-6 h-6" />
                           <span className="text-xs text-purple-300 font-medium">生成中 {Math.round(variant.progress)}%</span>
-                        </div>
-                      )}
-
-                      {variant.error && (
-                        <div className="absolute top-2 right-2 group/error">
-                          <AlertCircle className="w-5 h-5 text-red-500" />
-                          <div className="absolute right-0 top-6 w-48 bg-red-900/95 border border-red-700 rounded-lg p-2 text-xs text-red-100 opacity-0 group-hover/error:opacity-100 transition-opacity pointer-events-none z-20 shadow-lg">
-                            {variant.error}
-                          </div>
                         </div>
                       )}
 
@@ -5931,6 +6532,15 @@ const App: React.FC = () => {
                         </button>
                     </div>
 
+                    {scene.error && (
+                      <div className="absolute top-2 right-12 group/error z-20" onClick={e => e.stopPropagation()}>
+                        <AlertCircle className="w-4 h-4 text-red-500 drop-shadow-lg" />
+                        <div className="absolute right-0 top-5 w-48 bg-red-900/95 border border-red-700 rounded-lg p-2 text-[10px] text-red-100 opacity-0 group-hover/error:opacity-100 transition-opacity pointer-events-none shadow-lg">
+                          {scene.error}
+                        </div>
+                      </div>
+                    )}
+
                     <div className="w-24 h-24 bg-gray-900 rounded-md overflow-hidden shrink-0 relative group/img">
                        {scene.imageUrl ? (
                         <img src={scene.imageUrl} alt={scene.name} className="w-full h-full object-cover" />
@@ -5945,16 +6555,6 @@ const App: React.FC = () => {
                           <span className="text-[10px] text-green-300 font-medium">
                             {Math.round(scene.progress)}%
                           </span>
-                        </div>
-                      )}
-
-                      {/* 错误显示 */}
-                      {scene.error && (
-                        <div className="absolute top-1 right-1 group/error">
-                          <AlertCircle className="w-4 h-4 text-red-500" />
-                          <div className="absolute right-0 top-5 w-40 bg-red-900/95 border border-red-700 rounded-lg p-2 text-[10px] text-red-100 opacity-0 group-hover/error:opacity-100 transition-opacity pointer-events-none z-20 shadow-lg">
-                            {scene.error}
-                          </div>
                         </div>
                       )}
 
@@ -6114,13 +6714,20 @@ const App: React.FC = () => {
                                     </button>
                                 </>
                              ) : (
-                                <button 
+                                <button
                                     onClick={handleAddNewFrame}
                                     className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded font-medium"
                                 >
                                     <Plus size={14}/> 新增空白分镜
                                 </button>
                              )}
+                             <div className="w-px h-4 bg-gray-700 mx-1"></div>
+                             <button
+                                 onClick={() => setShowFindReplace(true)}
+                                 className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded font-medium"
+                             >
+                                 <Search size={14}/> 查找替换
+                             </button>
                         </div>
                     </div>
                 </div>
@@ -6679,14 +7286,29 @@ const App: React.FC = () => {
         
         {/* Frame Editor Modal */}
         {editingFrameId && editingFrame && currentProject && (
-          <FrameEditorModal 
-            frame={editingFrame} 
-            project={currentProject} 
+          <FrameEditorModal
+            frame={editingFrame}
+            project={currentProject}
             onSave={handleSaveFrameUpdate}
-            onClose={() => setEditingFrameId(null)} 
+            onClose={() => setEditingFrameId(null)}
           />
         )}
-        
+
+        {/* Find & Replace Modal */}
+        {showFindReplace && currentProject && currentEpisode && (
+          <FindReplaceModal
+            projects={projects}
+            currentProject={currentProject}
+            currentEpisode={currentEpisode}
+            onReplace={(updates) => {
+              for (const { projectId, episodeId, frames } of updates) {
+                handleUpdateEpisode(projectId, episodeId, { frames });
+              }
+            }}
+            onClose={() => setShowFindReplace(false)}
+          />
+        )}
+
         {/* Asset Editor Modal */}
         {editingAsset && currentProject && (() => {
            const asset = editingAsset.type === 'character' 
@@ -6795,6 +7417,7 @@ const App: React.FC = () => {
         {showGlobalSettingsModal && (
           <GlobalSettingsModal
             settings={globalSettings}
+            defaultProjectType={currentProject?.type}
             onSave={async (s) => {
               try {
                 await apiService.updateSettings(s);
