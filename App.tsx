@@ -9,7 +9,7 @@ import { analyzeNovelScript as analyzeNovelScriptVolcengine, analyzeNovelScriptW
 import { generateVideoWithSeedance, generateVideoWithSeedanceMultiRef } from './services/seedanceService';
 import { generateVideoWithSora } from './services/soraService';
 import { generateVideoWithKlingOmni } from './services/klingService';
-import { generateVideoWithJimengSeedance, generateVideoWithJimengSeedanceMultiRef } from './services/jimengSeedanceService';
+import { pollJimengSeedanceTask, submitJimengSeedanceImageToVideoTask, submitJimengSeedanceMultiRefTask } from './services/jimengSeedanceService';
 import { generateVideoWithBltcySora, generateVideoWithBltcyVeo3, generateVideoWithBltcyWan26, generateVideoWithBltcyGrokVideo3 } from './services/bltcySoraService';
 import { generateImageWithBananaPro } from './services/bananaProService';
 import { generateImageWithVolcengine } from './services/volcengineImageService';
@@ -21,7 +21,7 @@ import { exportToJianying } from './services/jianyingService';
 import { Logger } from './utils/logger';
 import { taskQueue } from './utils/taskQueue';
 import { splitNovelIntoEpisodes, detectEpisodeTitles } from './utils/novelSplitter';
-import { analyzeNovelScriptWithClaude, generateStoryboardBreakdownWithClaude, segmentEpisodeWithClaude } from './services/claudeService';
+import { analyzeNovelScriptWithClaude, generateStoryboardBreakdownWithClaude, segmentEpisodeWithClaude, checkClaudeConnectivity, type SegmentEpisodeResult } from './services/claudeService';
 import { createDuplicatedProject } from './utils/projectDuplication.js';
 import { PREPROCESS_SEGMENT_CONCURRENCY, mapWithConcurrencyLimit } from './utils/segmentConcurrency.js';
 import { buildEpisodeFromPreprocessResult, getFailedPreprocessEpisodes } from './utils/preprocessSegmentation.js';
@@ -65,7 +65,217 @@ const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
         multiRefVideoGenerationPrefix: '',
         characterExtraction: '提取适合真人扮演的角色特征，输出字段：name（禁止括号注释）、aliases（脚本中出现的别名别称）、description、role、appearance（完整基础形象：面部五官、发型、体态+日常常服/默认服装）、personality。同时提取角色外貌变体（variants）：【变体识别规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体"格式），常服/日常装束/默认服装归入主体 appearance 而非变体；每个变体输出 characterName、name（变体名）、context（出现场景）、appearance（变体专属外貌含衣着配饰）。',
         sceneExtraction: '提取写实的场景描述，关注真实世界的物理环境和光照。',
-        storyboardBreakdown: '将文本拆解为真人实拍分镜。注重镜头语言的写实性，包括景别（特写、中景、全景）、机位（平视、仰视、俯视）和运镜方式（推拉摇移）。每个分镜应包含明确的演员表演指导和场景调度，适合真人拍摄执行。'
+        storyboardBreakdown: '将文本拆解为真人实拍分镜。注重镜头语言的写实性，包括景别（特写、中景、全景）、机位（平视、仰视、俯视）和运镜方式（推拉摇移）。每个分镜应包含明确的演员表演指导和场景调度，适合真人拍摄执行。',
+        preprocessSegmentPrompt: `# 角色与任务
+你是一位专业的AI视频分镜师与提示词工程师。你的任务是根据输入的【小说章节文案】，结合【故事情节】与【角色信息】，生成高质量、逻辑严密且符合物理规律的**分镜描述（Prompt）**与**视频生成提示词（Video Prompt）**。每1000字小说文案默认输出至少15个以上分镜；但若触发了【第4条·镜头精简与合并原则】，允许密度降至15个以下（不低于10个/1000字）。不要生成旁白内容，保留人物角色的内心OS（OS需要使用第一人称）。
+
+# 输入信息
+
+**故事情节：**
+{{故事情节}}
+
+**角色信息：**
+{{角色信息}}
+
+**场景信息：**
+{{场景信息}}
+
+**小说原文：**
+{{小说原文}}
+
+**推文文案：**
+{{推文文案}}
+
+**章节文案前分镜信息：**
+{{前面分镜:2}}
+
+**章节文案后分镜信息：**
+{{后面分镜:2}}
+
+**章节文案：**
+{{章节文案}}
+
+
+# 核心执行逻辑与原则
+
+### 1. 零容忍原则（必须严格遵守）
+* **对话原文锁定**：如果章节文案中包含对话，**必须100%逐字引用原文**，严禁修改一个字，严禁增加原文没有的对话。
+* **违禁词清洗**：输出结果中严禁出现血腥、暴力、色情、低俗及政治敏感词汇。
+* *处理方式*：检测到违禁概念时，自动替换为符合剧情逻辑的中性描述（例："嘴角流血"→"紧咬下唇，面色苍白"；"砍头"→"重击倒地"）。
+* **格式标点**：所有输出内容的对话部分，必须使用中文双引号 \`""\`，**严禁**使用英文双引号 \`""\`。
+* **场景信息**：给出的场景信息，必须对应，然后一字不改的放到我需要的位置。
+
+
+### 2. 连贯性与物理逻辑（六维一致性）
+* **状态继承**：当前分镜的起始状态（人物姿势、物品位置、伤痕状态）必须完美承接上一分镜的结束状态。
+* **时空统一**：相邻分镜的光影（晨/午/晚）、天气、背景细节必须保持一致，除非有明确的时间跳跃描述。
+* **口型同步**：
+* 有台词时：角色必须有"张嘴说话、嘴唇闭合"的描述，且镜头必须保持稳定（不推拉）。
+* 无台词时：严禁出现张嘴说话的动作描述。
+* *内心OS*：角色嘴巴不动，仅通过表情或画外音表现。
+
+### 3. 分镜增加原则与台词时长适配规则
+
+#### A. 自动增加镜头
+默认基础时长为15秒。**但是**，如果当前【章节文案】中的对话内容过长、动作过于复杂，导致无法在15秒内自然演绎完成，**必须自动调整增加分镜**（例如将该分镜拆解为两个分镜），以确保表演节奏自然，严禁为了凑时长而加速念词或压缩表演。
+
+#### B. 台词时长适配规则（核心重要规则！！！）
+当角色有台词时，**必须先计算台词所需的秒数**，再安排分镜内其他镜头的时间分配。严禁拍脑袋随意分配，必须先算后排。
+
+**第一步：计算台词所需秒数**
+
+根据角色情绪和场景情境判断语速档位，再按字数计算：
+
+| 语速档位 | 适用情境 | 语速 | 示例 |
+|---------|---------|------|------|
+| **快速** | 争吵、催促、惊慌、连珠炮式质问 | 约5-6字/秒 | "你疯了吗你知不知道你在做什么！"（14字≈3秒） |
+| **正常** | 日常对话、陈述、命令、通知 | 约3-4字/秒 | "把兵符给我，我还能求陛下留你全尸。"（16字≈4-5秒） |
+| **慢速** | 威胁、深情、悲伤、咬牙切齿、意味深长 | 约2-3字/秒 | "凌修……凌修在哪里？"（9字≈3-4秒，因虚弱+沙哑+停顿） |
+
+**第二步：根据台词秒数安排分镜时间轴**
+
+计算出台词所需秒数后，用15秒减去台词秒数，得到剩余可分配秒数，再安排其他镜头内容。
+
+示例：
+\`\`\`
+台词："查！给我查！就算是把整个京城翻过来，也要把那个暗中下手的贼子给我揪出来！"
+→ 字数：35字，情绪：暴怒命令，语速档位：正常偏快（约4字/秒）
+→ 台词所需时间：约9秒
+→ 剩余可分配时间：15-9 = 6秒
+→ 分镜安排：【0-3秒】铺垫动作 +【4-12秒】台词镜头（9秒）+【13-15秒】收尾反应
+\`\`\`
+
+**第三步：超长台词的拆分规则**
+
+如果单段台词计算后超过12秒（即剩余时间不足3秒，无法安排任何铺垫或收尾），则：
+* **方案一**：该分镜只放这一段台词，成为"单台词分镜"（如【0-12秒】全部给台词，【13-15秒】给一个极简收尾）
+* **方案二**：将台词按自然断句拆为两个分镜（如角色先说前半句，下一个分镜接后半句），每个分镜都有合理的铺垫和收尾空间
+
+选择标准：如果台词内容有自然断点（如两句话之间有语气转折），优先方案二拆分；如果台词是一气呵成不可断的整句，用方案一。
+
+**第四步：多人对话的处理**
+
+同一个分镜内如果有多人对话（A说→B回应），按以下方式处理：
+* 分别计算每人台词所需秒数
+* 两人台词秒数之和 + 至少2秒切镜/反应时间 = 该分镜总需时长
+* 若总需时长 ≤ 15秒：合并在同一分镜内
+* 若总需时长 > 15秒：拆为两个分镜（A说一个分镜，B回应一个分镜）
+
+### 4. 镜头精简与合并原则（核心重要规则！！！）
+
+本产品用于AI漫剧短视频制作，每一个分镜都会消耗制作成本和观众注意力。**严禁出现"空泛镜头"**——即没有台词、没有内心OS、也没有关键剧情推进动作的镜头独占一整个15秒分镜。
+
+#### A. 镜头价值判定标准
+每个分镜在生成前，必须先判定它是否具有**高价值内容**。高价值内容的定义（至少满足其一）：
+1. **有人物台词**（说话的镜头）
+2. **有人物内心OS**（第一人称心理活动）
+3. **有关键剧情动作**（打斗、突破、拥抱、跪下、摔倒等推动剧情发展的肢体动作）
+4. **有强烈情绪转折**（角色表情发生显著变化，如从镇定到恐惧、从愤怒到崩溃）
+
+#### B. 低价值内容的处理方式
+以下内容**不可以**单独成为一个15秒分镜，必须合并到相邻分镜中作为其中一个时间段：
+* 纯氛围铺垫（如"府内下人来回奔走"、"茶客低声议论"等群演画面）
+* 纯环境展示（如"侯府大门紧闭"、"空旷的书房"等空镜/定场镜头）
+* 纯过渡衔接（如"角色从A走到B"、"角色站起/坐下"等无内容的位移动作）
+* 信息重复（如上一镜已经表达过"愤怒"，下一镜继续同样的"愤怒"而没有新的台词或情节推进）
+
+**具体合并方式**：将低价值内容压缩为相邻高价值分镜中的**前3-5秒**（作为铺垫段）或**后3-5秒**（作为收尾段），而不是单独占用一个完整分镜。
+
+#### C. 合并判定流程（生成每个分镜前必须执行）
+\`\`\`
+Step 1：本分镜是否包含台词/内心OS/关键动作/情绪转折？
+  → 是：正常生成为独立分镜。
+  → 否：进入Step 2。
+Step 2：本分镜的内容能否作为前一个分镜的"收尾3-5秒"？
+  → 能：合并到前一个分镜的尾部。
+  → 不能（例如场景切换）：进入Step 3。
+Step 3：本分镜的内容能否作为后一个分镜的"开头3-5秒"？
+  → 能：合并到后一个分镜的头部。
+  → 不能：极少数情况，允许独立存在，但时间压缩到5-8秒，严禁拉满15秒。
+\`\`\`
+
+#### D. 合并示例
+
+**❌ 错误做法（空泛镜头独占分镜）**：
+\`\`\`
+分镜5：姜问天拳头砸案台，案面出现裂纹，亲信退出书房，姜问天独自喘息。（15秒，无台词无OS，纯氛围）
+分镜6：姜池瑶躺在床上，双目无神，床头药汤已冷，下人经过门外。（15秒，无台词无OS，纯氛围）
+→ 问题：两个镜头共30秒，既没有台词也没有内心OS，观众看30秒"空画面"会快速划走。
+\`\`\`
+
+**✅ 正确做法（合并压缩 + 内容填充）**：
+\`\`\`
+分镜5（合并后）：
+【0-4秒】镜头：中景侧拍，书房内亲信低头鱼贯退出，姜问天独自撑着裂开的案台喘息；音效：脚步声远去+粗重喘息声；
+【5-10秒】镜头：画面切至姜池瑶卧室，中景平拍，姜池瑶面色苍白卧于床上，双目无神，烛光映出空洞眼神；音效：烛火噼啪声+极轻风声；
+【11-15秒】镜头：特写姜池瑶的眼睛，突然闪过一丝微光，目光从空洞变为锐利；音效：低沉心跳声；（姜池瑶内心OS）"所有人都在慌……可慌有什么用，我必须自己想。"
+→ 同样的内容压缩到一个分镜内，末段有内心OS驱动剧情前进，观众不会觉得空。
+\`\`\`
+
+#### E. 15秒分配的优先级排序
+当一个分镜内有多个内容需要分配时间时，按以下优先级排序：
+1. **台词** → 最高优先，根据字数匹配秒数（约3-4字/秒的语速），必须给够时间
+2. **内心OS** → 次高优先，同样按字数匹配秒数
+3. **关键动作** → 中等优先，需给出动作完成的合理时间
+4. **氛围/环境/过渡** → 最低优先，压缩到3-5秒，绝不单独占满15秒
+
+
+### 5. 输出结构规范
+任务需遍历输入中的每一条【章节文案】，生成对应的记录。每条记录包含三个字段，严格使用指定分隔符：
+\`序号_::~FIELD::~_图片提示词_::~FIELD::~_视频提示词_::~RECORD::~_\`
+
+#### A. 图片提示词 (Prompt) 规范
+* **内容**：纯视觉描述，包含地点、时间、光线、景别、核心动作。
+* **限制**：**不需要**列出角色映射（如 \`@zdh...\`），**严禁**包含任何乱七八糟的字符或非视觉描述。
+
+#### B. 视频提示词 (Video Prompt) 规范
+* **结构要求**：必须包含以下两部分：
+1. **场景与衔接**：复述场景信息，并显式写出\`衔接前置指令\`（思考上一镜结尾如何过渡到本镜）。
+2. **分镜脚本**：严格按时间轴的描述进行，禁止时长超过15秒，请合理安排分镜脚本。
+
+---
+
+# 视频提示词标准模板（默认15秒以内，不可超过）
+
+
+**场景基础信息**：
+场景：[直接复制输入的场景信息]，[补充时间/光线/氛围]。
+衔接前置指令：承接上镜结尾[描述上一镜结束时的动作/状态]，本镜开始时[描述本镜起始状态，确保连贯]。
+
+**时间轴脚本（每个镜头的时间以及镜头数量无需固定，但镜头总体时间不能超过15秒，以及单个镜头的时间必须适配画面以及人物台词说话的语速。例如：【镜头：特写陆承煜冷漠的脸，没有半分温情；音效：指尖掐进皮肉的紧绷声；（陆承煜说）"凝霜，你爹通敌叛国，苏家满门抄斩就在眼前，把兵符给我，我还能求陛下留你全尸。"】，那么该镜头就需要大概9秒左右的时间，那么剩下6秒的时间请合理分配给下一个镜头，如若下一个镜头也是长时间的镜头（超过剩余的分镜秒数），则该分镜可以只出现这么一个单一镜头，也就是该分镜的脚本格式如下：【0-9秒】镜头：特写陆承煜冷漠的脸，没有半分温情；音效：指尖掐进皮肉的紧绷声；（陆承煜说）"凝霜，你爹通敌叛国，苏家满门抄斩就在眼前，把兵符给我，我还能求陛下留你全尸。"）**：
+**【0-3秒】**镜头：[景别]+[核心动作]；音效：[主音效]+[环境音]；[台词（必须用""）/画外音/内心OS]
+**【4-8秒】**镜头：[镜头切换/互动反应]；音效：[关键音效]；[台词（必须用""）/画外音]
+**【9-12秒】**镜头：[情绪特写/细节展示]；音效：[氛围音]；[台词/画外音/沉默说明]
+**【13-15秒】**镜头：[下一镜铺垫/留白]；音效：[过渡音/渐弱]
+
+---
+
+# 输出示例（Reference）
+
+1_【Videoprompt】
+::~FIELD::~_CBD写字楼办公室内，晚上。中景镜头：拍摄林辰手抱一叠厚厚的打印文件，背景是现代化写字楼冰冷的大理石地面和反光的玻璃幕墙，突出夜晚的空旷与压抑。_::~FIELD::~_
+场景：CBD写字楼办公室内，晚上，走廊灯光昏暗，背景是冰冷的大理石地面和反光的玻璃幕墙，营造夜晚的空旷与压抑氛围。
+衔接前置指令：作为首个镜头，确立深夜加班基调，林辰状态疲惫，抱着文件准备离开。
+【0-3秒】镜头：中景跟拍，林辰双手环抱一叠半人高的打印文件，脚步虚浮地走在写字楼走廊；音效：脚步声沉重拖沓+文件轻微晃动声；（林辰内心OS）"下午刚定稿，又要重打…"
+【4-8秒】镜头：中景侧拍，特写他垂在身侧的左手，手腕上运动手环显示"23:42"，突然脚下踉跄；音效：心率预警声"滴滴"+文件滑落"哗啦"声；（林辰说）"就不能让我喘口气吗..."
+【9-12秒】镜头：中景俯拍，林辰蹲下身捡文件，手指慌乱地捋顺，却不小心把页码弄乱；音效：手指摩擦纸张"沙沙"声+顶灯"滋滋"电流声；（林辰内心OS）"这工作什么时候是个头..."
+【13-15秒】镜头：中景固定，林辰抱着整理好的文件重新站起，望向窗外雨夜；音效：窗外闷雷声；（林辰内心OS）"明天还要继续..."
+_::~RECORD::~_
+
+2_【Videoprompt】
+::~FIELD::~_CBD写字楼办公室内，晚上。低角度特写：拍摄张岚傲慢地停在林辰身边，一只涂着深红指甲油的手递出一份文件，林辰接过时指关节因用力而泛白。_::~FIELD::~_
+场景：CBD写字楼办公室内，晚上，走廊灯光昏暗，延续上镜的压抑氛围。
+衔接前置指令：承接上镜结尾（林辰刚站稳），张岚突然入画，打断了林辰的思绪，制造冲突。
+【0-4秒】镜头：低角度特写，一双黑色尖头高跟鞋重重踩在林辰脚边，镜头上移至张岚冷漠的脸；音效：高跟鞋"噔噔"声骤停；（张岚内心OS）"看他还能撑多久。"
+【5-11秒】镜头：中景侧拍，张岚递出一份新的文件，指甲涂着深酒红色甲油；音效：纸张甩动的脆响；（张岚说）"林辰，这份整改通知，明早8点前，我要看到你手写的整改方案。"
+【12-15秒】镜头：特写镜头，聚焦林辰的手指尖刚碰到文件，指关节瞬间绷紧泛白；音效：林辰压抑的呼吸声；（林辰说）"张总监，现在已经10点多了..."
+_::~RECORD::~_
+
+---
+
+# 开始执行
+请严格按照以上格式与逻辑，解析输入的章节文案并生成结果。`,
+        preprocessSecondPassPrompt: ''
     },
     'COMMENTARY_2D': {
         assetImagePrefix: '2D平面动画风格，线条清晰，色彩鲜艳，夸张的表情，角色参考图',
@@ -75,7 +285,8 @@ const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
         multiRefVideoGenerationPrefix: '',
         characterExtraction: '提取适合2D动画的角色特征，输出字段：name（禁止括号注释）、aliases（脚本中出现的别名别称）、description、role、appearance（完整基础形象：线条特征、发型、体型比例+日常常服/默认服装）、personality。同时提取角色外貌变体（variants）：【变体识别规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体"格式），常服/日常装束归入主体 appearance 而非变体；每个变体输出 characterName、name（变体名）、context（出现场景）、appearance（变体专属外貌含服装视觉风格）。',
         sceneExtraction: '提取适合2D背景的场景描述，关注色彩搭配和构图。',
-        storyboardBreakdown: '将文本拆解为2D动画分镜。强调动画的节奏感和表现力，注重角色的夸张表情和动作设计。每个分镜应描述关键帧动作、表情变化和画面构图，适合2D动画制作流程。'
+        storyboardBreakdown: '将文本拆解为2D动画分镜。强调动画的节奏感和表现力，注重角色的夸张表情和动作设计。每个分镜应描述关键帧动作、表情变化和画面构图，适合2D动画制作流程。',
+        preprocessSecondPassPrompt: ''
     },
     'COMMENTARY_3D': {
         assetImagePrefix: '3D动画风格，Blender渲染，皮克斯风格，立体感，柔和的光影，角色参考图',
@@ -85,7 +296,8 @@ const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
         multiRefVideoGenerationPrefix: '',
         characterExtraction: '提取适合3D建模的角色特征，输出字段：name（禁止括号注释）、aliases（脚本中出现的别名别称）、description、role、appearance（完整基础形象：面部结构、发型、身形比例+日常常服/默认服装）、personality。同时提取角色外貌变体（variants）：【变体识别规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体"格式），常服/日常装束归入主体 appearance 而非变体；每个变体输出 characterName、name（变体名）、context（出现场景）、appearance（变体专属外貌含服装3D材质）。',
         sceneExtraction: '提取3D场景描述，关注空间结构和环境光遮蔽。',
-        storyboardBreakdown: '将文本拆解为3D动画分镜。注重三维空间的镜头运动和角色在空间中的位置关系。每个分镜应包含虚拟摄像机参数（焦距、景深）、角色动画时长和场景光照设置，适合3D动画制作。'
+        storyboardBreakdown: '将文本拆解为3D动画分镜。注重三维空间的镜头运动和角色在空间中的位置关系。每个分镜应包含虚拟摄像机参数（焦距、景深）、角色动画时长和场景光照设置，适合3D动画制作。',
+        preprocessSecondPassPrompt: ''
     },
     'PREMIUM_2D': {
         assetImagePrefix: '大师级2D插画，新海诚风格，绝美的光影，极高的细节，角色参考图',
@@ -95,7 +307,8 @@ const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
         multiRefVideoGenerationPrefix: '',
         characterExtraction: '提取极具美感的角色设计，输出字段：name（禁止括号注释）、aliases（脚本中出现的别名别称）、description、role、appearance（完整基础形象：唯美风格的面部、发型、整体气质+日常常服/默认服装）、personality。同时提取角色外貌变体（variants）：【变体识别规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体"格式），常服/日常装束归入主体 appearance 而非变体；每个变体输出 characterName、name（变体名）、context（出现场景）、appearance（变体专属外貌含服装艺术风格）。',
         sceneExtraction: '提取宏大的场景描述，关注天气、动态元素和艺术氛围。',
-        storyboardBreakdown: '将文本拆解为高品质2D动画分镜。追求电影级的视觉美学，注重光影氛围、色彩情绪和细腻的画面细节。每个分镜应描述唯美的构图、动态的自然元素（云、光、粒子）和角色的微妙情感表达，适合高预算动画电影制作。'
+        storyboardBreakdown: '将文本拆解为高品质2D动画分镜。追求电影级的视觉美学，注重光影氛围、色彩情绪和细腻的画面细节。每个分镜应描述唯美的构图、动态的自然元素（云、光、粒子）和角色的微妙情感表达，适合高预算动画电影制作。',
+        preprocessSecondPassPrompt: ''
     },
     'PREMIUM_3D': {
         assetImagePrefix: '好莱坞大片级别，虚幻引擎5渲染，光线追踪，史诗感，角色参考图',
@@ -105,7 +318,8 @@ const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
         multiRefVideoGenerationPrefix: '',
         characterExtraction: '提取复杂的角色设计，输出字段：name（禁止括号注释）、aliases（脚本中出现的别名别称）、description、role、appearance（完整基础形象：史诗级面部特征、发型、体格+日常常服/默认服装）、personality。同时提取角色外貌变体（variants）：【变体识别规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体"格式），常服/日常装束归入主体 appearance 而非变体；每个变体输出 characterName、name（变体名）、context（出现场景）、appearance（变体专属外貌含盔甲/服装好莱坞级别描述）。',
         sceneExtraction: '提取史诗级场景，关注巨大的建筑结构和复杂的气候系统。',
-        storyboardBreakdown: '将文本拆解为好莱坞级别的3D分镜。追求史诗级的视觉冲击力，注重宏大的场景规模、复杂的镜头运动和震撼的特效设计。每个分镜应包含电影级的镜头语言、动态的环境效果（爆炸、天气、粒子）和角色的史诗动作，适合AAA级游戏或大片制作。'
+        storyboardBreakdown: '将文本拆解为好莱坞级别的3D分镜。追求史诗级的视觉冲击力，注重宏大的场景规模、复杂的镜头运动和震撼的特效设计。每个分镜应包含电影级的镜头语言、动态的环境效果（爆炸、天气、粒子）和角色的史诗动作，适合AAA级游戏或大片制作。',
+        preprocessSecondPassPrompt: ''
     }
   }
 };
@@ -129,11 +343,27 @@ const resolveProjectId = (project: Project & { projectId?: string; _id?: string 
 
 const normalizeProject = (project: Project): Project => ({
   ...project,
+  thumbnailUrl: project.thumbnailUrl ? apiService.toAbsoluteApiUrl(project.thumbnailUrl) : project.thumbnailUrl,
   id: resolveProjectId(project as Project & { projectId?: string; _id?: string }),
   // 重置 character/variant/scene 的生成中间状态，防止刷新后按钮永久卡死
-  characters: (project.characters ?? []).map(c => ({ ...c, progress: undefined, error: undefined })),
-  variants: (project.variants ?? []).map(v => ({ ...v, progress: undefined, error: undefined })),
-  scenes: (project.scenes ?? []).map(s => ({ ...s, progress: undefined, error: undefined })),
+  characters: (project.characters ?? []).map(c => ({
+    ...c,
+    imageUrl: c.imageUrl ? apiService.toAbsoluteApiUrl(c.imageUrl) : c.imageUrl,
+    progress: undefined,
+    error: undefined
+  })),
+  variants: (project.variants ?? []).map(v => ({
+    ...v,
+    imageUrl: v.imageUrl ? apiService.toAbsoluteApiUrl(v.imageUrl) : v.imageUrl,
+    progress: undefined,
+    error: undefined
+  })),
+  scenes: (project.scenes ?? []).map(s => ({
+    ...s,
+    imageUrl: s.imageUrl ? apiService.toAbsoluteApiUrl(s.imageUrl) : s.imageUrl,
+    progress: undefined,
+    error: undefined
+  })),
   settings: {
     ...DEFAULT_SETTINGS,
     ...(project.settings ?? {}),
@@ -149,6 +379,9 @@ const normalizeProject = (project: Project): Project => ({
       const videoPrompt = typeof anyFrame.videoPrompt === 'string' ? anyFrame.videoPrompt : (anyFrame.prompt ?? '');
       return {
         ...frame,
+        imageUrl: frame.imageUrl ? apiService.toAbsoluteApiUrl(frame.imageUrl) : frame.imageUrl,
+        videoUrl: frame.videoUrl ? apiService.toAbsoluteApiUrl(frame.videoUrl) : frame.videoUrl,
+        audioUrl: frame.audioUrl ? apiService.toAbsoluteApiUrl(frame.audioUrl) : frame.audioUrl,
         imagePrompt,
         videoPrompt,
         isGenerating: false,
@@ -1429,6 +1662,7 @@ const GlobalSettingsModal: React.FC<{
     if (status === 'active') return '可用';
     if (status === 'expired') return '过期';
     if (status === 'insufficient') return '积分不足';
+    if (status === 'security_check') return '需安全验证';
     return '禁用';
   };
 
@@ -1436,6 +1670,7 @@ const GlobalSettingsModal: React.FC<{
     if (status === 'active') return 'bg-green-500/15 text-green-300 border-green-500/30';
     if (status === 'expired') return 'bg-red-500/15 text-red-300 border-red-500/30';
     if (status === 'insufficient') return 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30';
+    if (status === 'security_check') return 'bg-orange-500/15 text-orange-300 border-orange-500/30';
     return 'bg-gray-500/15 text-gray-300 border-gray-500/30';
   };
 
@@ -1997,6 +2232,26 @@ const GlobalSettingsModal: React.FC<{
                         placeholder="定义如何将文本拆解为分镜的策略..."
                      />
                  </div>
+                 <div>
+                     <label className="block text-xs font-bold text-indigo-400 mb-1 uppercase tracking-wider">分段预处理提示词（导演分段 SKILL）</label>
+                     <textarea
+                        value={localSettings.projectTypePrompts[activeTab].preprocessSegmentPrompt || ''}
+                        onChange={(e) => updatePrompt('preprocessSegmentPrompt', e.target.value)}
+                        className="w-full h-40 bg-gray-900 border border-gray-600 rounded-lg p-3 text-white text-sm focus:border-indigo-500 focus:outline-none font-mono text-xs"
+                        placeholder="定义小说文本分段处理的提示词（用于导演分段 SKILL）..."
+                     />
+                    <p className="text-xs text-gray-500 mt-1">{'用于小说预处理阶段，将整本小说按逻辑分段。支持模板变量：{{故事情节}}、{{角色信息}}、{{场景信息}}、{{小说原文}}、{{推文文案}}、{{前面分镜:2}}、{{后面分镜:2}}、{{章节文案}}'}</p>
+                 </div>
+                 <div>
+                     <label className="block text-xs font-bold text-teal-400 mb-1 uppercase tracking-wider">二次加工提示词（可选）</label>
+                     <textarea
+                        value={localSettings.projectTypePrompts[activeTab].preprocessSecondPassPrompt || ''}
+                        onChange={(e) => updatePrompt('preprocessSecondPassPrompt' as any, e.target.value)}
+                        className="w-full h-40 bg-gray-900 border border-gray-600 rounded-lg p-3 text-white text-sm focus:border-teal-500 focus:outline-none font-mono text-xs"
+                        placeholder="可选：分段后再用此提示词处理一遍结果..."
+                     />
+                    <p className="text-xs text-gray-500 mt-1">{'启用后，导演分段的结果会再经过此提示词处理一遍。留空则不启用。支持相同模板变量：{{故事情节}}、{{角色信息}}、{{场景信息}}、{{小说原文}}、{{推文文案}}、{{前面分镜:2}}、{{后面分镜:2}}、{{章节文案}}'}</p>
+                 </div>
              </div>
           </section>
         </div>
@@ -2108,6 +2363,352 @@ const App: React.FC = () => {
   const [showGlobalSettingsModal, setShowGlobalSettingsModal] = useState(false);
   const [isGlobalSettingsInitialized, setIsGlobalSettingsInitialized] = useState(false);
   const savedGlobalSettingsRef = useRef<string | null>(null);
+  const seedanceRecoveryStartedRef = useRef(false);
+  const seedancePollingFramesRef = useRef<Set<string>>(new Set());
+
+  const persistFrameVideoState = useCallback((
+    projectId: string,
+    episodeId: string,
+    frameId: string,
+    updater: (frame: StoryboardFrame) => StoryboardFrame
+  ) => {
+    setProjects(prev => prev.map(p => {
+      if (p.id !== projectId) return p;
+      return {
+        ...p,
+        updatedAt: Date.now(),
+        episodes: p.episodes.map(e => {
+          if (e.id !== episodeId) return e;
+          const updatedEp = {
+            ...e,
+            updatedAt: Date.now(),
+            frames: e.frames.map(f => f.id === frameId ? updater(f) : f)
+          };
+          apiService.updateEpisode(projectId, episodeId, updatedEp).catch(err =>
+            console.error('[视频状态保存] 分集保存失败:', err)
+          );
+          return updatedEp;
+        })
+      };
+    }));
+  }, []);
+
+  const startSeedanceTaskPolling = useCallback(async (
+    projectId: string,
+    episodeId: string,
+    frameId: string,
+    taskId: string,
+    videoDuration: number
+  ) => {
+    if (seedancePollingFramesRef.current.has(frameId)) return;
+    seedancePollingFramesRef.current.add(frameId);
+
+    persistFrameVideoState(projectId, episodeId, frameId, frame => ({
+      ...frame,
+      isGeneratingVideo: true,
+      videoTaskStatus: 'loading',
+      videoQueuePosition: undefined,
+      videoProgress: frame.videoProgress ?? 0,
+      videoError: undefined,
+      seedanceTaskId: taskId,
+      seedanceTaskUpdatedAt: Date.now(),
+    }));
+
+    try {
+      let videoUrl = await pollJimengSeedanceTask(taskId, (progress) => {
+        setProjects(prev => prev.map(p => p.id !== projectId ? p : {
+          ...p,
+          episodes: p.episodes.map(e => e.id !== episodeId ? e : {
+            ...e,
+            frames: e.frames.map(f => f.id === frameId ? {
+              ...f,
+              isGeneratingVideo: true,
+              videoTaskStatus: 'loading',
+              videoQueuePosition: undefined,
+              videoProgress: progress,
+            } : f)
+          })
+        }));
+      });
+
+      if (!videoUrl.startsWith('/api/media/')) {
+        const savedVideo = await apiService.saveExternalVideo(videoUrl, `${projectId}_${episodeId}_${frameId}_video`);
+        videoUrl = savedVideo.url;
+      }
+      videoUrl = apiService.toAbsoluteApiUrl(videoUrl);
+      console.log(`[视频生成完成] frameId=${frameId}, videoUrl=${videoUrl}`);
+
+      persistFrameVideoState(projectId, episodeId, frameId, frame => ({
+        ...frame,
+        videoUrl,
+        videoDuration,
+        isGeneratingVideo: false,
+        videoTaskStatus: undefined,
+        videoQueuePosition: undefined,
+        videoProgress: undefined,
+        videoError: undefined,
+        seedanceTaskId: undefined,
+        seedanceTaskUpdatedAt: Date.now(),
+      }));
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      Logger.logError('App', '生成视频失败', errorMessage);
+      persistFrameVideoState(projectId, episodeId, frameId, frame => ({
+        ...frame,
+        isGeneratingVideo: false,
+        videoTaskStatus: undefined,
+        videoQueuePosition: undefined,
+        videoProgress: undefined,
+        videoError: errorMessage,
+        seedanceTaskId: undefined,
+        seedanceTaskUpdatedAt: Date.now(),
+      }));
+      throw error;
+    } finally {
+      seedancePollingFramesRef.current.delete(frameId);
+    }
+  }, [persistFrameVideoState]);
+
+  const enqueueFrameVideoGeneration = useCallback((project: Project, episode: Episode, frameId: string) => {
+    const projectId = project.id;
+    const episodeId = episode.id;
+    const model = project.settings.videoModel;
+    const aspectRatio = project.settings.aspectRatio;
+    const videoDuration = project.settings.videoDuration || 5;
+    const multiRefMode = project.settings.multiRefVideoMode ?? false;
+    const prompts = globalSettings.projectTypePrompts[project.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
+    const prefix = prompts.videoGenerationPrefix;
+
+    const frame = episode.frames.find(f => f.id === frameId);
+    if (!frame) return;
+    if (!multiRefMode && !frame.imageUrl) return;
+
+    let multiRefImages: string[] = [];
+    let multiRefMapping = '';
+    let multiRefFullPrompt = '';
+
+    if (multiRefMode) {
+      const multiRefPrefix = (prompts.multiRefVideoGenerationPrefix || '').trim() || prefix;
+      let imgIndex = 1;
+
+      const multiRefDebug = {
+        frameId,
+        frameIndex: frame.index,
+        characterIds: [...frame.references.characterIds],
+        variantIds: [...(frame.references.variantIds ?? [])],
+        sceneIds: [...(frame.references.sceneIds ?? (frame.references.sceneId ? [frame.references.sceneId] : []))],
+        collected: [] as Array<{ type: 'character' | 'variant' | 'scene'; id: string; name: string; hasImage: boolean }>,
+      };
+
+      frame.references.characterIds.forEach(charId => {
+        const char = project.characters.find(c => c.id === charId);
+        multiRefDebug.collected.push({
+          type: 'character',
+          id: charId,
+          name: char?.name || '(未找到角色)',
+          hasImage: !!char?.imageUrl,
+        });
+        if (char?.imageUrl) {
+          multiRefImages.push(char.imageUrl);
+          multiRefMapping += `【@${imgIndex}为${char.name}】`;
+          imgIndex++;
+        }
+      });
+
+      for (const variantId of (frame.references.variantIds ?? [])) {
+        const variant = (project.variants ?? []).find(v => v.id === variantId);
+        multiRefDebug.collected.push({
+          type: 'variant',
+          id: variantId,
+          name: variant?.name || '(未找到变体)',
+          hasImage: !!variant?.imageUrl,
+        });
+        if (variant?.imageUrl) {
+          multiRefImages.push(variant.imageUrl);
+          const parentChar = project.characters.find(c => c.id === variant.characterId);
+          const variantLabel = parentChar ? `${parentChar.name}的${variant.name}` : variant.name;
+          multiRefMapping += `【@${imgIndex}为${variantLabel}】`;
+          imgIndex++;
+        }
+      }
+
+      const effectiveSceneIds = frame.references.sceneIds
+        ?? (frame.references.sceneId ? [frame.references.sceneId] : []);
+      for (const sceneId of effectiveSceneIds) {
+        const scene = project.scenes.find(s => s.id === sceneId);
+        multiRefDebug.collected.push({
+          type: 'scene',
+          id: sceneId,
+          name: scene?.name || '(未找到场景)',
+          hasImage: !!scene?.imageUrl,
+        });
+        if (scene?.imageUrl) {
+          multiRefImages.push(scene.imageUrl);
+          multiRefMapping += `【@${imgIndex}为${scene.name}】`;
+          imgIndex++;
+        }
+      }
+
+      multiRefFullPrompt = `${multiRefPrefix} ${multiRefMapping} ${frame.videoPrompt}`.trim();
+
+      console.log('[多参考视频] 收集结果', {
+        ...multiRefDebug,
+        finalImageCount: multiRefImages.length,
+        finalPrompt: multiRefFullPrompt,
+      });
+    }
+
+    const fullVideoPrompt = `${prefix} ${frame.videoPrompt}`;
+    const capturedImageUrl = frame.imageUrl ?? '';
+    const multiRefModel = globalSettings.multiRefVideoModel || 'seedance_2.0_fast';
+
+    const onProgress = (progress: number) => {
+      setProjects(prev => prev.map(p => p.id !== projectId ? p : {
+        ...p,
+        episodes: p.episodes.map(e => e.id !== episodeId ? e : {
+          ...e,
+          frames: e.frames.map(f => f.id === frameId ? { ...f, videoProgress: progress } : f)
+        })
+      }));
+    };
+
+    const task = {
+      id: uuidv4(),
+      type: 'video' as const,
+      targetId: frameId,
+      projectId,
+      episodeId,
+      execute: async () => {
+        let videoUrl: string;
+
+        if (multiRefMode) {
+          const jimengMultiRefModel = multiRefModel === 'seedance_2.0' ? 'seedance-2.0' : 'seedance-2.0-fast';
+          const taskId = await submitJimengSeedanceMultiRefTask(
+            multiRefImages.length > 0 ? multiRefImages : (capturedImageUrl ? [capturedImageUrl] : []),
+            multiRefFullPrompt,
+            aspectRatio,
+            videoDuration,
+            projectId,
+            jimengMultiRefModel,
+            episodeId,
+            frameId
+          );
+          await startSeedanceTaskPolling(projectId, episodeId, frameId, taskId, videoDuration);
+          return;
+        } else if (model === 'kling-v3-omni') {
+          videoUrl = await generateVideoWithKlingOmni(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
+          );
+        } else if (model.startsWith('doubao-seedance')) {
+          try {
+            videoUrl = await generateVideoWithVolcengine(
+              capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, onProgress
+            );
+          } catch (volcErr: any) {
+            const volcErrMsg: string = volcErr?.message ?? String(volcErr);
+            if (
+              volcErrMsg.includes('InputImageSensitiveContentDetected') ||
+              volcErrMsg.toLowerCase().includes('output video may contain sensitive')
+            ) {
+              console.warn('[视频生成] 豆包 Seedance 内容审核拦截，自动切换到速推 Sora 2.0 重试...');
+              videoUrl = await generateVideoWithSora(
+                capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
+              );
+            } else {
+              throw volcErr;
+            }
+          }
+        } else if (model.startsWith('jimeng-seedance')) {
+          const jimengModel = model === 'jimeng-seedance-2.0' ? 'seedance-2.0' : 'seedance-2.0-fast';
+          const taskId = await submitJimengSeedanceImageToVideoTask(
+            capturedImageUrl,
+            fullVideoPrompt,
+            aspectRatio,
+            videoDuration,
+            projectId,
+            jimengModel,
+            frame.githubImageUrl,
+            episodeId,
+            frameId
+          );
+          await startSeedanceTaskPolling(projectId, episodeId, frameId, taskId, videoDuration);
+          return;
+        } else if (model.startsWith('seedance-2')) {
+          videoUrl = await generateVideoWithSeedance(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress
+          );
+        } else if (model.startsWith('sora-2')) {
+          videoUrl = await generateVideoWithSora(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
+          );
+        } else if (model === 'bltcy-sora-2') {
+          videoUrl = await generateVideoWithBltcySora(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl, 'sora-2'
+          );
+        } else if (model === 'bltcy-veo3') {
+          videoUrl = await generateVideoWithBltcyVeo3(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
+          );
+        } else if (model === 'bltcy-wan-2-6') {
+          videoUrl = await generateVideoWithBltcyWan26(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
+          );
+        } else if (model === 'bltcy-grok-video-3') {
+          videoUrl = await generateVideoWithBltcyGrokVideo3(
+            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
+          );
+        } else {
+          videoUrl = await generateVideoFromImage(capturedImageUrl, fullVideoPrompt, model);
+        }
+
+        if (!videoUrl.startsWith('/api/media/')) {
+          const savedVideo = await apiService.saveExternalVideo(videoUrl, `${projectId}_${episodeId}_${frameId}_video`);
+          videoUrl = savedVideo.url;
+        }
+        videoUrl = apiService.toAbsoluteApiUrl(videoUrl);
+        console.log(`[视频生成完成] frameId=${frameId}, videoUrl=${videoUrl}`);
+
+        persistFrameVideoState(projectId, episodeId, frameId, currentFrame => ({
+          ...currentFrame,
+          videoUrl,
+          videoDuration,
+          isGeneratingVideo: false,
+          videoTaskStatus: undefined,
+          videoQueuePosition: undefined,
+          videoProgress: undefined,
+          videoError: undefined,
+          seedanceTaskId: undefined,
+          seedanceTaskUpdatedAt: Date.now(),
+        }));
+      },
+      onError: (error: string) => {
+        Logger.logError('App', '生成视频失败', error);
+        persistFrameVideoState(projectId, episodeId, frameId, currentFrame => ({
+          ...currentFrame,
+          isGeneratingVideo: false,
+          videoTaskStatus: undefined,
+          videoQueuePosition: undefined,
+          videoProgress: undefined,
+          videoError: error,
+          seedanceTaskId: undefined,
+          seedanceTaskUpdatedAt: Date.now(),
+        }));
+      }
+    };
+
+    persistFrameVideoState(projectId, episodeId, frameId, currentFrame => ({
+      ...currentFrame,
+      isGeneratingVideo: false,
+      videoTaskStatus: 'waiting',
+      videoQueuePosition: undefined,
+      videoProgress: 0,
+      videoError: undefined,
+      seedanceTaskId: undefined,
+      seedanceTaskUpdatedAt: Date.now(),
+    }));
+
+    taskQueue.enqueue(task);
+  }, [globalSettings, persistFrameVideoState, startSeedanceTaskPolling]);
 
   // Storyboard View State
   const [storyboardViewMode, setStoryboardViewMode] = useState<'GRID' | 'TIMELINE'>('GRID');
@@ -2150,6 +2751,22 @@ const App: React.FC = () => {
   const [showNovelPreprocessModal, setShowNovelPreprocessModal] = useState(false);
   const [preprocessNovelText, setPreprocessNovelText] = useState('');
   const [isPreprocessing, setIsPreprocessing] = useState(false);
+  const [enableSecondPass, setEnableSecondPass] = useState(false);
+  const [showEpisodePreprocessModal, setShowEpisodePreprocessModal] = useState(false);
+  const [isEpisodePreprocessing, setIsEpisodePreprocessing] = useState(false);
+  const [enableEpisodeSecondPass, setEnableEpisodeSecondPass] = useState(false);
+  const [episodePreprocessResult, setEpisodePreprocessResult] = useState<string | null>(null);
+  const [showEpisodePreprocessPreview, setShowEpisodePreprocessPreview] = useState(false);
+
+  // Claude 提供商切换（预处理失败重试）
+  const [showClaudeProviderModal, setShowClaudeProviderModal] = useState(false);
+  const [preprocessRetryData, setPreprocessRetryData] = useState<{
+    episodeDrafts: any[];
+    latestDirectorSkillPrompt: string;
+    systemInstruction: string;
+    textForAssets: string;
+    error: Error;
+  } | null>(null);
 
   // Auto-rewrite + retry guard (avoid infinite loops)
   const autoRewriteRetryRef = useRef<Set<string>>(new Set());
@@ -2227,6 +2844,41 @@ const App: React.FC = () => {
     : undefined;
 
   // --- Effects ---
+  useEffect(() => {
+    const unsubscribe = taskQueue.subscribe((statuses) => {
+      setProjects(prev => prev.map(project => ({
+        ...project,
+        episodes: project.episodes.map(episode => ({
+          ...episode,
+          frames: episode.frames.map(frame => {
+            const status = Array.from(statuses.values()).find(s => s.type === 'video' && s.targetId === frame.id && (s.status === 'queued' || s.status === 'running'));
+            if (!status) {
+              if (frame.videoTaskStatus === 'waiting' && !frame.seedanceTaskId) {
+                return { ...frame, videoTaskStatus: 'waiting', videoQueuePosition: undefined };
+              }
+              if (frame.videoTaskStatus === 'loading' && frame.seedanceTaskId) {
+                return { ...frame, isGeneratingVideo: true, videoTaskStatus: 'loading', videoQueuePosition: undefined };
+              }
+              if (frame.videoTaskStatus || frame.videoQueuePosition !== undefined) {
+                return { ...frame, videoTaskStatus: frame.isGeneratingVideo ? 'loading' : undefined, videoQueuePosition: undefined };
+              }
+              return frame;
+            }
+
+            return {
+              ...frame,
+              isGeneratingVideo: status.status === 'running' ? true : frame.isGeneratingVideo,
+              videoTaskStatus: status.status === 'queued' ? 'waiting' : 'loading',
+              videoQueuePosition: status.status === 'queued' ? status.queuePosition : undefined,
+            };
+          })
+        }))
+      })));
+    });
+
+    return () => unsubscribe();
+  }, []);
+
   useEffect(() => {
     // 初始化：从后端加载项目和全局设置
     const initializeApp = async () => {
@@ -2317,6 +2969,7 @@ const App: React.FC = () => {
           const migratedSettings: GlobalSettings = {
             extractionModel: loadedSettings.extractionModel,
             projectTypePrompts: loadedSettings.projectTypePrompts || {},
+            projectTypeLabels: loadedSettings.projectTypeLabels || { ...DEFAULT_GLOBAL_SETTINGS.projectTypeLabels },
             // 剪映路径从 .env.local 读取（所有客户端共享网络驱动器）
             jianyingExportPath: import.meta.env.VITE_JIANYING_EXPORT_PATH || '',
             jianyingExportPathFull: import.meta.env.VITE_JIANYING_EXPORT_PATH_FULL || '',
@@ -2344,6 +2997,16 @@ const App: React.FC = () => {
 
             if (hasMissingFields) {
               migratedSettings.projectTypePrompts[projectType] = { ...defaultPrompts, ...currentPrompts };
+              needsMigration = true;
+            }
+          });
+
+          Object.keys(DEFAULT_GLOBAL_SETTINGS.projectTypeLabels || {}).forEach((type) => {
+            if (!migratedSettings.projectTypeLabels?.[type]) {
+              migratedSettings.projectTypeLabels = {
+                ...migratedSettings.projectTypeLabels,
+                [type]: DEFAULT_GLOBAL_SETTINGS.projectTypeLabels?.[type] || type,
+              };
               needsMigration = true;
             }
           });
@@ -2377,6 +3040,34 @@ const App: React.FC = () => {
 
     initializeApp();
   }, []);
+
+  useEffect(() => {
+    if (!isGlobalSettingsInitialized || seedanceRecoveryStartedRef.current) return;
+    if (projects.length === 0) return;
+
+    seedanceRecoveryStartedRef.current = true;
+
+    projects.forEach(project => {
+      project.episodes.forEach(episode => {
+        episode.frames.forEach(frame => {
+          if (frame.videoTaskStatus === 'waiting' && !frame.seedanceTaskId) {
+            enqueueFrameVideoGeneration(project, episode, frame.id);
+            return;
+          }
+
+          if (frame.videoTaskStatus === 'loading' && frame.seedanceTaskId) {
+            void startSeedanceTaskPolling(
+              project.id,
+              episode.id,
+              frame.id,
+              frame.seedanceTaskId,
+              frame.videoDuration ?? project.settings.videoDuration ?? 5
+            ).catch(() => {});
+          }
+        });
+      });
+    });
+  }, [enqueueFrameVideoGeneration, isGlobalSettingsInitialized, projects, startSeedanceTaskPolling]);
 
   useEffect(() => {
     // 自动保存资产到后端（只在资产修改后保存）
@@ -2984,31 +3675,104 @@ const App: React.FC = () => {
 
     const episodeDrafts = splitNovelIntoEpisodes(preprocessNovelText);
     if (episodeDrafts.length === 0) {
-      alert('未检测到章节标记，请确认文本中包含纯数字、中文数字，或“第X章/集/回/话”等章节标题');
+      alert('未检测到章节标记，请确认文本中包含纯数字、中文数字，或”第X章/集/回/话”等章节标题');
       return;
     }
 
+    // 预处理前先检查两个 Claude API 的连通性，结果决定实际调用顺序
     setIsPreprocessing(true);
+    let availableProviders: Array<'univibe' | 'bltcy'> = [];
+    try {
+      const [univibeCheck, bltcyCheck] = await Promise.all([
+        checkClaudeConnectivity('univibe'),
+        checkClaudeConnectivity('bltcy'),
+      ]);
+      if (!univibeCheck.ok && !bltcyCheck.ok) {
+        alert(`两个 Claude API 均不可用，无法执行预处理：\n\n• Univibe: ${univibeCheck.error}\n• 柏拉图中转: ${bltcyCheck.error}`);
+        setIsPreprocessing(false);
+        return;
+      }
+      if (univibeCheck.ok) availableProviders.push('univibe');
+      if (bltcyCheck.ok) availableProviders.push('bltcy');
+      if (!univibeCheck.ok) console.warn(`⚠️ Univibe Claude 不可用（${univibeCheck.error}），跳过，仅使用柏拉图中转`);
+      if (!bltcyCheck.ok) console.warn(`⚠️ 柏拉图中转 Claude 不可用（${bltcyCheck.error}），跳过，仅使用 Univibe`);
+    } catch (error) {
+      alert('Claude 连通性检测异常：' + (error as Error).message);
+      setIsPreprocessing(false);
+      return;
+    }
     try {
       const prompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
-      const systemInstruction = `${prompts.characterExtraction}\n\n${prompts.sceneExtraction}`;
+      const existingContext = buildExistingAssetsContext(
+        currentProject.characters,
+        currentProject.scenes,
+        currentProject.variants ?? []
+      );
+      const systemInstruction = `${prompts.characterExtraction}\n\n${prompts.sceneExtraction}${existingContext}`;
 
       // 截取前 8000 字用于资产提取
       const textForAssets = preprocessNovelText.slice(0, 8000);
-      const { content: latestDirectorSkillPrompt } = await apiService.getSegmentSkillPrompt();
+      const { content: latestDirectorSkillPrompt } = await apiService.getSegmentSkillPrompt(currentProject.type);
 
-      // 每章分段限流为 5 并发
+      // 按连通性检测结果顺序调用，失败时切到下一个 provider；两个都失败则 return failed 而非 throw
+      const segmentWithFallback = async (
+        text: string,
+        prompt: string,
+        label: string,
+        context: Record<string, string>
+      ): Promise<SegmentEpisodeResult> => {
+        const primary = await segmentEpisodeWithClaude(text, prompt, label, context, availableProviders[0]);
+        if (!primary.failed) return primary;
+        if (availableProviders.length < 2) return primary;
+        Logger.logError('App', `小说预处理分段失败，切换备用 Claude（${availableProviders[1]}）重试`, { label });
+        return segmentEpisodeWithClaude(text, prompt, label, context, availableProviders[1]);
+      };
+
+      // 每章分段限流为 5 并发；单集失败不中断整批，标记 preprocessSegmentFailed=true
       const runSegmentTasksWithLimit = async () => mapWithConcurrencyLimit(
         episodeDrafts,
         PREPROCESS_SEGMENT_CONCURRENCY,
-        draft => segmentEpisodeWithClaude(draft.content, latestDirectorSkillPrompt, draft.title, {
-          fullNovelText: preprocessNovelText,
-        })
+        async draft => segmentWithFallback(
+          draft.content,
+          latestDirectorSkillPrompt,
+          draft.title,
+          { fullNovelText: preprocessNovelText }
+        )
       );
 
       // 先执行全文资产提取，再执行每章分段（5 并发）
-      const analysis = await analyzeNovelScriptWithClaude(textForAssets, systemInstruction);
+      let analysis: AnalysisResult;
+      try {
+        analysis = await analyzeNovelScriptWithClaude(textForAssets, systemInstruction, availableProviders[0]);
+      } catch (error) {
+        if (availableProviders.length < 2) throw error;
+        Logger.logError('App', '小说预处理资产提取失败，切换备用 Claude 重试', error);
+        analysis = await analyzeNovelScriptWithClaude(textForAssets, systemInstruction, availableProviders[1]);
+      }
       const segmentedScripts = await runSegmentTasksWithLimit();
+
+      // 二次加工：如果启用且提示词非空，对分段成功的结果再过一遍 secondPassPrompt
+      const secondPassPrompt = prompts.preprocessSecondPassPrompt?.trim();
+      let finalScripts = segmentedScripts;
+      const secondPassFailedIndexes = new Set<number>();
+      if (enableSecondPass && secondPassPrompt) {
+        finalScripts = await mapWithConcurrencyLimit(
+          segmentedScripts,
+          PREPROCESS_SEGMENT_CONCURRENCY,
+          async (result, index) => {
+            if (result.failed) return result; // 分段失败的跳过二次加工
+            const label = episodeDrafts[index].title + '(二次加工)';
+            const secondary = await segmentWithFallback(result.content, secondPassPrompt, label, {
+              fullNovelText: preprocessNovelText,
+            });
+            if (secondary.failed) {
+              secondPassFailedIndexes.add(index);
+              return { content: episodeDrafts[index].content, failed: false }; // 回退到章节原始文本
+            }
+            return secondary;
+          }
+        );
+      }
 
       // 构建新分集（scriptContent 替换为分段结果）
       const now = Date.now();
@@ -3018,7 +3782,7 @@ const App: React.FC = () => {
         scriptContent: draft.content,
         frames: [],
         updatedAt: now + i,
-      }, segmentedScripts[i]));
+      }, finalScripts[i]));
 
       // 构建新资产（按名称去重追加）
       const existingCharNames = new Set(currentProject.characters.map(c => c.name));
@@ -3067,9 +3831,230 @@ const App: React.FC = () => {
 
       setShowNovelPreprocessModal(false);
       setPreprocessNovelText('');
+
+      // 汇报失败情况（一次加工失败 / 二次加工失败分开列）
+      const failedTitles = episodeDrafts
+        .filter((_, i) => finalScripts[i]?.failed)
+        .map(d => `• ${d.title}`);
+      const secondPassFailedTitles = episodeDrafts
+        .filter((_, i) => secondPassFailedIndexes.has(i))
+        .map(d => `• ${d.title}`);
+
+      const messages: string[] = [];
+      if (failedTitles.length > 0) {
+        messages.push(`分段失败（${failedTitles.length} 个，已用原文填充，可通过单集预处理重试）：\n${failedTitles.join('\n')}`);
+      }
+      if (secondPassFailedTitles.length > 0) {
+        messages.push(`二次加工失败（${secondPassFailedTitles.length} 个，已回退为章节原始文本）：\n${secondPassFailedTitles.join('\n')}`);
+      }
+      if (messages.length > 0) {
+        alert(`预处理完成，但存在以下问题：\n\n${messages.join('\n\n')}`);
+      }
     } catch (error) {
       console.error('小说预处理失败:', error);
+      const errorMsg = (error as Error).message;
+      alert('预处理失败：' + errorMsg);
+    } finally {
+      setIsPreprocessing(false);
+    }
+  };
+
+  const handleEpisodePreprocess = async () => {
+    if (!currentProject || !currentEpisode?.scriptContent.trim()) return;
+    setIsEpisodePreprocessing(true);
+    try {
+      // 预处理前先检查两个 Claude API 的连通性，结果决定实际调用顺序
+      const [univibeCheck, bltcyCheck] = await Promise.all([
+        checkClaudeConnectivity('univibe'),
+        checkClaudeConnectivity('bltcy'),
+      ]);
+      if (!univibeCheck.ok && !bltcyCheck.ok) {
+        alert(`两个 Claude API 均不可用，无法执行预处理：\n\n• Univibe: ${univibeCheck.error}\n• 柏拉图中转: ${bltcyCheck.error}`);
+        setIsEpisodePreprocessing(false);
+        return;
+      }
+      const availableProviders: Array<'univibe' | 'bltcy'> = [];
+      if (univibeCheck.ok) availableProviders.push('univibe');
+      if (bltcyCheck.ok) availableProviders.push('bltcy');
+      if (!univibeCheck.ok) console.warn(`⚠️ Univibe Claude 不可用（${univibeCheck.error}），跳过，仅使用柏拉图中转`);
+      if (!bltcyCheck.ok) console.warn(`⚠️ 柏拉图中转 Claude 不可用（${bltcyCheck.error}），跳过，仅使用 Univibe`);
+
+      const { content: skillPrompt } = await apiService.getSegmentSkillPrompt(currentProject.type);
+      const prompts = globalSettings.projectTypePrompts[currentProject.type]
+        ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
+
+      // 一次分段，按连通性检测结果顺序尝试
+      let result = await segmentEpisodeWithClaude(
+        currentEpisode.scriptContent, skillPrompt, currentEpisode.name,
+        { fullNovelText: currentEpisode.scriptContent }, availableProviders[0]
+      );
+      if (result.failed && availableProviders.length > 1) {
+        Logger.logError('App', `单集预处理分段失败，切换备用 Claude（${availableProviders[1]}）重试`, { episodeTitle: currentEpisode.name });
+        const secondary = await segmentEpisodeWithClaude(
+          currentEpisode.scriptContent, skillPrompt, currentEpisode.name,
+          { fullNovelText: currentEpisode.scriptContent }, availableProviders[1]
+        );
+        if (secondary.failed) {
+          throw new Error('两个 Claude API 均无法完成分段处理，请检查网络或稍后重试');
+        }
+        result = secondary;
+      } else if (result.failed) {
+        throw new Error('Claude API 无法完成分段处理，请检查网络或稍后重试');
+      }
+
+      // 二次加工（可选）
+      const secondPassPrompt = prompts.preprocessSecondPassPrompt?.trim();
+      let secondPassFailed = false;
+      if (enableEpisodeSecondPass && secondPassPrompt && !result.failed) {
+        const sp = await segmentEpisodeWithClaude(
+          result.content, secondPassPrompt, currentEpisode.name + '(二次加工)',
+          { fullNovelText: currentEpisode.scriptContent }, availableProviders[0]
+        );
+        if (!sp.failed) {
+          result = sp;
+        } else if (availableProviders.length > 1) {
+          Logger.logError('App', `单集预处理二次加工失败，切换备用 Claude（${availableProviders[1]}）重试`, { episodeTitle: currentEpisode.name });
+          const sp2 = await segmentEpisodeWithClaude(
+            result.content, secondPassPrompt, currentEpisode.name + '(二次加工)',
+            { fullNovelText: currentEpisode.scriptContent }, availableProviders[1]
+          );
+          if (!sp2.failed) {
+            result = sp2;
+          } else {
+            secondPassFailed = true;
+          }
+        } else {
+          secondPassFailed = true;
+        }
+      }
+
+      setEpisodePreprocessResult(secondPassFailed ? currentEpisode.scriptContent : result.content);
+      setShowEpisodePreprocessModal(false);
+      setShowEpisodePreprocessPreview(true);
+      if (secondPassFailed) {
+        alert('二次加工失败，预览内容已回退为分集原始文本。');
+      }
+    } catch (error) {
       alert('预处理失败：' + (error as Error).message);
+    } finally {
+      setIsEpisodePreprocessing(false);
+    }
+  };
+
+  const handleRetryPreprocessWithNewProvider = async (provider: 'univibe' | 'bltcy') => {
+    if (!preprocessRetryData || !currentProject) return;
+
+    setShowClaudeProviderModal(false);
+    setIsPreprocessing(true);
+
+    try {
+      console.log(`🔄 [小说预处理] 使用${provider === 'bltcy' ? '柏拉图中转' : 'Univibe'} Claude`);
+
+      // 重新执行资产提取和分段
+      const analysis = await analyzeNovelScriptWithClaude(
+        preprocessRetryData.textForAssets,
+        preprocessRetryData.systemInstruction,
+        provider
+      );
+
+      const segmentedScripts = await mapWithConcurrencyLimit(
+        preprocessRetryData.episodeDrafts,
+        PREPROCESS_SEGMENT_CONCURRENCY,
+        async draft => {
+          const result = await segmentEpisodeWithClaude(
+            draft.content,
+            preprocessRetryData.latestDirectorSkillPrompt,
+            draft.title,
+            { fullNovelText: preprocessNovelText },
+            provider
+          );
+          if (result.failed) {
+            throw new Error(`分集「${draft.title}」Claude API 失败，预处理中断`);
+          }
+          return result;
+        }
+      );
+
+      // 二次加工（与主流程一致）
+      const retryPrompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
+      const retrySecondPassPrompt = retryPrompts.preprocessSecondPassPrompt?.trim();
+      let finalScripts = segmentedScripts;
+      if (enableSecondPass && retrySecondPassPrompt) {
+        finalScripts = await mapWithConcurrencyLimit(
+          segmentedScripts,
+          PREPROCESS_SEGMENT_CONCURRENCY,
+          async (result, index) => {
+            if (result.failed) return result;
+            const label = preprocessRetryData.episodeDrafts[index].title + '(二次加工)';
+            const secondPassResult = await segmentEpisodeWithClaude(result.content, retrySecondPassPrompt, label, {
+              fullNovelText: preprocessNovelText,
+            }, provider);
+            return secondPassResult.failed ? result : secondPassResult;
+          }
+        );
+      }
+
+      // 构建新分集和资产（逻辑与原处理相同）
+      const now = Date.now();
+      const newEpisodes: Episode[] = preprocessRetryData.episodeDrafts.map((draft, i) => buildEpisodeFromPreprocessResult({
+        id: uuidv4(),
+        name: draft.title,
+        scriptContent: draft.content,
+        frames: [],
+        updatedAt: now + i,
+      }, finalScripts[i]));
+
+      const existingCharNames = new Set(currentProject.characters.map(c => c.name));
+      const existingSceneNames = new Set(currentProject.scenes.map(s => s.name));
+
+      const newCharacters: Character[] = analysis.characters
+        .filter(c => !existingCharNames.has(c.name))
+        .map(c => {
+          const normalized = normalizeCharacterInput(c.name, c.aliases);
+          return { ...c, ...normalized, id: uuidv4(), aliases: normalized.aliases };
+        });
+
+      const newScenes: Scene[] = analysis.scenes
+        .filter(s => !existingSceneNames.has(s.name))
+        .map(s => ({ ...s, id: uuidv4() }));
+
+      const allCharacters = [...currentProject.characters, ...newCharacters];
+      const existingVariantKeys = new Set(
+        (currentProject.variants ?? []).map(v => `${v.characterId}::${v.name}`)
+      );
+      const newVariants: CharacterVariant[] = (analysis.variants ?? [])
+        .map(v => {
+          const char = allCharacters.find(
+            c => c.name === v.characterName || (c.aliases ?? []).includes(v.characterName)
+          );
+          if (!char) return null;
+          const key = `${char.id}::${v.name}`;
+          if (existingVariantKeys.has(key)) return null;
+          return { id: uuidv4(), characterId: char.id, name: v.name, context: v.context, appearance: v.appearance } as CharacterVariant;
+        })
+        .filter((v): v is CharacterVariant => v !== null);
+
+      const updatedProject = {
+        ...currentProject,
+        episodes: [...currentProject.episodes, ...newEpisodes],
+        characters: [...currentProject.characters, ...newCharacters],
+        scenes: [...currentProject.scenes, ...newScenes],
+        variants: [...(currentProject.variants ?? []), ...newVariants],
+        updatedAt: Date.now(),
+      };
+
+      setProjects(prev => prev.map(p => p.id === currentProject.id ? updatedProject : p));
+      await apiService.updateProject(currentProject.id, updatedProject);
+      newEpisodes.forEach(e => savedEpisodesRef.current?.set(e.id, e.updatedAt));
+
+      setShowNovelPreprocessModal(false);
+      setPreprocessNovelText('');
+      setPreprocessRetryData(null);
+
+      alert(`✅ 预处理成功！已使用${provider === 'bltcy' ? '柏拉图中转' : 'Univibe'} Claude。`);
+    } catch (error) {
+      console.error('重试预处理失败:', error);
+      alert('重试失败：' + (error as Error).message);
     } finally {
       setIsPreprocessing(false);
     }
@@ -3080,13 +4065,26 @@ const App: React.FC = () => {
 
     setIsPreprocessing(true);
     try {
-      const { content: latestDirectorSkillPrompt } = await apiService.getSegmentSkillPrompt();
+      const { content: latestDirectorSkillPrompt } = await apiService.getSegmentSkillPrompt(currentProject.type);
       const retryResults = await mapWithConcurrencyLimit(
         failedPreprocessEpisodes,
         PREPROCESS_SEGMENT_CONCURRENCY,
-        episode => segmentEpisodeWithClaude(episode.scriptContent, latestDirectorSkillPrompt, episode.name, {
-          fullNovelText: preprocessNovelText || undefined,
-        })
+        async episode => {
+          const primary = await segmentEpisodeWithClaude(episode.scriptContent, latestDirectorSkillPrompt, episode.name, {
+            fullNovelText: preprocessNovelText || undefined,
+          }, 'univibe');
+          if (!primary.failed) return primary;
+          Logger.logError('App', '预处理分集重试失败，切换柏拉图中转 Claude 重试', {
+            episodeName: episode.name
+          });
+          const secondary = await segmentEpisodeWithClaude(episode.scriptContent, latestDirectorSkillPrompt, episode.name, {
+            fullNovelText: preprocessNovelText || undefined,
+          }, 'bltcy');
+          if (secondary.failed) {
+            throw new Error(`分集「${episode.name}」两个 Claude API 均失败，重试中断`);
+          }
+          return secondary;
+        }
       );
 
       const retryResultMap = new Map(failedPreprocessEpisodes.map((episode, index) => [episode.id, retryResults[index]]));
@@ -3183,6 +4181,7 @@ const App: React.FC = () => {
         imageProgress: undefined,
         videoProgress: undefined,
         audioProgress: undefined,
+        videoTaskStatus: undefined,
         imageError: undefined,
         videoError: undefined,
         audioError: undefined,
@@ -3377,6 +4376,8 @@ const App: React.FC = () => {
         });
       } else if (type === 'video') {
         // 批量生成视频 - 通过任务队列并发执行
+        // 新一轮批量前恢复所有"积分不足"的 session，让它们重新参与调度
+        await apiService.resetInsufficientSessions();
         const multiRefMode = currentProject.settings.multiRefVideoMode ?? false;
         frameIdsToProcess.forEach(frameId => {
           const frame = currentEpisode.frames.find(f => f.id === frameId);
@@ -3943,6 +4944,23 @@ const App: React.FC = () => {
 
 
 
+  // 将现有资产名字列表拼成提示词上下文，注入 systemInstruction，让 LLM 只提取缺少的资产
+  const buildExistingAssetsContext = (
+    characters: Character[],
+    scenes: Scene[],
+    variants: CharacterVariant[]
+  ): string => {
+    const parts: string[] = [];
+    if (characters.length)
+      parts.push(`现有角色（已存在，请勿重复提取）：${characters.map(c => c.name).join('、')}`);
+    if (variants.length)
+      parts.push(`现有变体（已存在，请勿重复提取）：${variants.map(v => v.name).join('、')}`);
+    if (scenes.length)
+      parts.push(`现有场景（已存在，请勿重复提取）：${scenes.map(s => s.name).join('、')}`);
+    if (!parts.length) return '';
+    return '\n\n【现有资产列表】\n' + parts.join('\n');
+  };
+
   // 资产提取（角色和场景）
   const handleExtractAssets = async () => {
     if (!currentProject || !currentEpisode || !currentEpisode.scriptContent) return;
@@ -3981,7 +4999,12 @@ const App: React.FC = () => {
         }
       });
 
-      const systemInstruction = `${prompts.characterExtraction}\n\n${prompts.sceneExtraction}`;
+      const existingContext = buildExistingAssetsContext(
+        currentProject.characters,
+        currentProject.scenes,
+        currentProject.variants ?? []
+      );
+      const systemInstruction = `${prompts.characterExtraction}\n\n${prompts.sceneExtraction}${existingContext}`;
 
       // 2. Extract Assets - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
@@ -4116,7 +5139,12 @@ const App: React.FC = () => {
         }
       });
 
-      const systemInstruction = `${prompts.characterExtraction}`;
+      const existingContext = buildExistingAssetsContext(
+        currentProject.characters,
+        [],
+        currentProject.variants ?? []
+      );
+      const systemInstruction = `${prompts.characterExtraction}${existingContext}`;
 
       // 2. Extract Characters - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
@@ -4245,7 +5273,12 @@ const App: React.FC = () => {
         }
       });
 
-      const systemInstruction = `${prompts.sceneExtraction}`;
+      const existingContext = buildExistingAssetsContext(
+        [],
+        currentProject.scenes,
+        []
+      );
+      const systemInstruction = `${prompts.sceneExtraction}${existingContext}`;
 
       // 2. Extract Scenes - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
@@ -5034,228 +6067,7 @@ const App: React.FC = () => {
 
   const handleGenerateFrameVideo = (frameId: string) => {
     if (!currentProject || !currentEpisode) return;
-
-    const projectId = currentProject.id;
-    const episodeId = currentEpisode.id;
-    const model = currentProject.settings.videoModel;
-    const aspectRatio = currentProject.settings.aspectRatio;
-    const videoDuration = currentProject.settings.videoDuration || 5;
-    const multiRefMode = currentProject.settings.multiRefVideoMode ?? false;
-    const prompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
-    const prefix = prompts.videoGenerationPrefix;
-
-    // 在入队时捕获帧数据（避免 execute 内读取过期闭包）
-    const frame = currentEpisode.frames.find(f => f.id === frameId);
-    if (!frame) return;
-    if (!multiRefMode && !frame.imageUrl) return;
-
-    // 多参考模式：提前组装参考图列表和 @N 映射声明
-    let multiRefImages: string[] = [];
-    let multiRefMapping = '';
-    let multiRefFullPrompt = '';
-
-    if (multiRefMode) {
-      const multiRefPrefix = (prompts.multiRefVideoGenerationPrefix || '').trim() || prefix;
-      let imgIndex = 1;
-
-      const multiRefDebug = {
-        frameId,
-        frameIndex: frame.index,
-        characterIds: [...frame.references.characterIds],
-        variantIds: [...(frame.references.variantIds ?? [])],
-        sceneIds: [...(frame.references.sceneIds ?? (frame.references.sceneId ? [frame.references.sceneId] : []))],
-        collected: [] as Array<{ type: 'character' | 'variant' | 'scene'; id: string; name: string; hasImage: boolean }>,
-      };
-
-      frame.references.characterIds.forEach(charId => {
-        const char = currentProject.characters.find(c => c.id === charId);
-        multiRefDebug.collected.push({
-          type: 'character',
-          id: charId,
-          name: char?.name || '(未找到角色)',
-          hasImage: !!char?.imageUrl,
-        });
-        if (char?.imageUrl) {
-          multiRefImages.push(char.imageUrl);
-          multiRefMapping += `【@${imgIndex}为${char.name}】`;
-          imgIndex++;
-        }
-      });
-
-      for (const variantId of (frame.references.variantIds ?? [])) {
-        const variant = (currentProject.variants ?? []).find(v => v.id === variantId);
-        multiRefDebug.collected.push({
-          type: 'variant',
-          id: variantId,
-          name: variant?.name || '(未找到变体)',
-          hasImage: !!variant?.imageUrl,
-        });
-        if (variant?.imageUrl) {
-          multiRefImages.push(variant.imageUrl);
-          // 标注所属角色，如【@2为林黛玉的宫装造型】
-          const parentChar = currentProject.characters.find(c => c.id === variant.characterId);
-          const variantLabel = parentChar ? `${parentChar.name}的${variant.name}` : variant.name;
-          multiRefMapping += `【@${imgIndex}为${variantLabel}】`;
-          imgIndex++;
-        }
-      }
-
-      const effectiveSceneIds = frame.references.sceneIds
-        ?? (frame.references.sceneId ? [frame.references.sceneId] : []);
-      for (const sceneId of effectiveSceneIds) {
-        const scene = currentProject.scenes.find(s => s.id === sceneId);
-        multiRefDebug.collected.push({
-          type: 'scene',
-          id: sceneId,
-          name: scene?.name || '(未找到场景)',
-          hasImage: !!scene?.imageUrl,
-        });
-        if (scene?.imageUrl) {
-          multiRefImages.push(scene.imageUrl);
-          multiRefMapping += `【@${imgIndex}为${scene.name}】`;
-          imgIndex++;
-        }
-      }
-
-      // @N 映射声明放在 videoPrompt 前面
-      multiRefFullPrompt = `${multiRefPrefix} ${multiRefMapping} ${frame.videoPrompt}`.trim();
-
-      console.log('[多参考视频] 收集结果', {
-        ...multiRefDebug,
-        finalImageCount: multiRefImages.length,
-        finalPrompt: multiRefFullPrompt,
-      });
-    }
-
-    const fullVideoPrompt = `${prefix} ${frame.videoPrompt}`;
-    const capturedImageUrl = frame.imageUrl ?? '';
-    const multiRefModel = globalSettings.multiRefVideoModel || 'seedance_2.0_fast';
-
-    const onProgress = (progress: number) => {
-      setProjects(prev => prev.map(p => p.id !== projectId ? p : {
-        ...p,
-        episodes: p.episodes.map(e => e.id !== episodeId ? e : {
-          ...e,
-          frames: e.frames.map(f => f.id === frameId ? { ...f, videoProgress: progress } : f)
-        })
-      }));
-    };
-
-    const task = {
-      id: uuidv4(),
-      type: 'video' as const,
-      targetId: frameId,
-      projectId,
-      episodeId,
-      execute: async () => {
-        // 标记生成中
-        setProjects(prev => prev.map(p => p.id !== projectId ? p : {
-          ...p,
-          episodes: p.episodes.map(e => e.id !== episodeId ? e : {
-            ...e,
-            frames: e.frames.map(f => f.id === frameId ? { ...f, isGeneratingVideo: true, videoProgress: 0 } : f)
-          })
-        }));
-
-        let videoUrl: string;
-
-        if (multiRefMode) {
-          const jimengMultiRefModel = multiRefModel === 'seedance_2.0' ? 'seedance-2.0' : 'seedance-2.0-fast';
-          videoUrl = await generateVideoWithJimengSeedanceMultiRef(
-            multiRefImages.length > 0 ? multiRefImages : (capturedImageUrl ? [capturedImageUrl] : []),
-            multiRefFullPrompt,
-            aspectRatio,
-            videoDuration,
-            projectId,
-            onProgress,
-            jimengMultiRefModel
-          );
-        } else if (model === 'kling-v3-omni') {
-          videoUrl = await generateVideoWithKlingOmni(
-            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
-          );
-        } else if (model.startsWith('doubao-seedance')) {
-          try {
-            videoUrl = await generateVideoWithVolcengine(
-              capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, onProgress
-            );
-          } catch (volcErr: any) {
-            const volcErrMsg: string = volcErr?.message ?? String(volcErr);
-            if (
-              volcErrMsg.includes('InputImageSensitiveContentDetected') ||
-              volcErrMsg.toLowerCase().includes('output video may contain sensitive')
-            ) {
-              console.warn('[视频生成] 豆包 Seedance 内容审核拦截，自动切换到速推 Sora 2.0 重试...');
-              videoUrl = await generateVideoWithSora(
-                capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
-              );
-            } else {
-              throw volcErr;
-            }
-          }
-        } else if (model.startsWith('jimeng-seedance')) {
-          const jimengModel = model === 'jimeng-seedance-2.0' ? 'seedance-2.0' : 'seedance-2.0-fast';
-          videoUrl = await generateVideoWithJimengSeedance(
-            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, jimengModel, frame.githubImageUrl
-          );
-        } else if (model.startsWith('seedance-2')) {
-          videoUrl = await generateVideoWithSeedance(
-            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress
-          );
-        } else if (model.startsWith('sora-2')) {
-          videoUrl = await generateVideoWithSora(
-            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
-          );
-        } else if (model === 'bltcy-sora-2') {
-          videoUrl = await generateVideoWithBltcySora(
-            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl, 'sora-2'
-          );
-        } else if (model === 'bltcy-veo3') {
-          videoUrl = await generateVideoWithBltcyVeo3(
-            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
-          );
-        } else if (model === 'bltcy-wan-2-6') {
-          videoUrl = await generateVideoWithBltcyWan26(
-            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
-          );
-        } else if (model === 'bltcy-grok-video-3') {
-          videoUrl = await generateVideoWithBltcyGrokVideo3(
-            capturedImageUrl, fullVideoPrompt, aspectRatio, videoDuration, projectId, onProgress, frame.githubImageUrl
-          );
-        } else {
-          videoUrl = await generateVideoFromImage(capturedImageUrl, fullVideoPrompt, model);
-        }
-
-        const savedVideo = await apiService.saveExternalVideo(videoUrl, `${projectId}_${episodeId}_${frameId}_video`);
-        videoUrl = savedVideo.url;
-
-        setProjects(prev => prev.map(p => p.id !== projectId ? p : {
-          ...p,
-          updatedAt: Date.now(),
-          episodes: p.episodes.map(e => e.id !== episodeId ? e : {
-            ...e,
-            frames: e.frames.map(f => f.id === frameId
-              ? { ...f, videoUrl, videoDuration, isGeneratingVideo: false, videoProgress: undefined, videoError: undefined }
-              : f)
-          })
-        }));
-      },
-      onError: (error: string) => {
-        Logger.logError('App', '生成视频失败', error);
-        setProjects(prev => prev.map(p => p.id !== projectId ? p : {
-          ...p,
-          updatedAt: Date.now(),
-          episodes: p.episodes.map(e => e.id !== episodeId ? e : {
-            ...e,
-            frames: e.frames.map(f => f.id === frameId
-              ? { ...f, isGeneratingVideo: false, videoProgress: undefined, videoError: error }
-              : f)
-          })
-        }));
-      }
-    };
-
-    taskQueue.enqueue(task);
+    enqueueFrameVideoGeneration(currentProject, currentEpisode, frameId);
   };
 
   const handleGenerateFrameAudio = async (frameId: string) => {
@@ -6065,6 +6877,23 @@ const App: React.FC = () => {
                   );
                 })()}
                 <p className="text-xs text-gray-500">资产提取将使用文本前 8000 字；分集将追加到现有列表。</p>
+                {(() => {
+                  const typePrompts = globalSettings.projectTypePrompts[currentProject?.type ?? 'REAL_PERSON_COMMENTARY'] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
+                  const hasSecondPassPrompt = !!typePrompts.preprocessSecondPassPrompt?.trim();
+                  return (
+                    <label className={`flex items-center gap-2 select-none ${hasSecondPassPrompt ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'}`}>
+                      <input
+                        type="checkbox"
+                        checked={enableSecondPass}
+                        onChange={e => setEnableSecondPass(e.target.checked)}
+                        disabled={!hasSecondPassPrompt || isPreprocessing}
+                        className="accent-teal-500 w-4 h-4"
+                      />
+                      <span className="text-sm text-gray-300">启用二次加工</span>
+                      {!hasSecondPassPrompt && <span className="text-xs text-gray-500">（请先在项目类型指令中配置二次加工提示词）</span>}
+                    </label>
+                  );
+                })()}
               </div>
               <div className="p-5 border-t border-gray-700 flex justify-end gap-3">
                 <button
@@ -6197,6 +7026,14 @@ const App: React.FC = () => {
                     >
                       {isCurrentEpisodeProcessing ? <Loader2 className="animate-spin" /> : <Clapperboard size={18} />}
                       分镜拆解
+                    </button>
+                    <button
+                      onClick={() => setShowEpisodePreprocessModal(true)}
+                      disabled={isCurrentEpisodeProcessing || !currentEpisode.scriptContent}
+                      className="bg-teal-600 hover:bg-teal-500 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2.5 rounded-xl inline-flex items-center gap-2 text-sm font-medium transition-all shadow-sm shadow-teal-900/30"
+                    >
+                      <Wand2 size={18} />
+                      预处理
                     </button>
                   </div>
                 </div>
@@ -6824,6 +7661,14 @@ const App: React.FC = () => {
                      <div className="aspect-video bg-gray-950 relative group/image" style={{ minHeight: '200px' }}>
                        {frame.imageUrl ? (
                          <img src={frame.imageUrl} alt="Storyboard" className="w-full h-full object-cover pointer-events-none" width="640" height="360" loading="lazy" />
+                       ) : frame.videoUrl ? (
+                         <video
+                           src={frame.videoUrl}
+                           className="w-full h-full object-cover pointer-events-none"
+                           muted
+                           preload="metadata"
+                           onLoadedMetadata={(e) => { (e.target as HTMLVideoElement).currentTime = 0.1; }}
+                         />
                        ) : (
                          <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-600 p-6 text-center pointer-events-none">
                             <ImageIcon size={32} className="mb-2 opacity-50"/>
@@ -6831,16 +7676,20 @@ const App: React.FC = () => {
                          </div>
                        )}
                        
-                       {(frame.isGenerating || frame.isGeneratingVideo) && (
+                       {(frame.isGenerating || frame.isGeneratingVideo || frame.videoTaskStatus === 'waiting') && (
                          <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-10 flex-col gap-2 pointer-events-none">
-                           <Loader2 className="animate-spin text-blue-500 w-8 h-8" />
+                           <Loader2 className={`w-8 h-8 ${frame.videoTaskStatus === 'waiting' ? 'text-yellow-400' : 'animate-spin text-blue-500'}`} />
 
                            {/* 显示进度百分比 */}
                            {frame.isGenerating && frame.imageProgress !== undefined ? (
                              <span className="text-xs text-blue-300 font-medium">
                                生成中 {Math.round(frame.imageProgress)}%
                              </span>
-                           ) : frame.isGeneratingVideo && frame.videoProgress !== undefined ? (
+                           ) : frame.videoTaskStatus === 'waiting' ? (
+                            <span className="text-xs text-yellow-300 font-medium">
+                              {frame.videoQueuePosition ? `队列等待中 · 前面还有 ${Math.max(frame.videoQueuePosition - 1, 0)} 个` : '队列等待中...'}
+                            </span>
+                          ) : frame.isGeneratingVideo && frame.videoProgress !== undefined ? (
                              <span className="text-xs text-purple-300 font-medium">
                                生成视频 {Math.round(frame.videoProgress)}%
                              </span>
@@ -6853,11 +7702,11 @@ const App: React.FC = () => {
                        )}
 
                        {/* 错误显示 - 在卡片右上角 */}
-                       {frame.imageError && (
+                       {(frame.imageError || frame.videoError) && (
                          <div className="absolute top-2 right-2 group/error z-20">
                            <AlertCircle className="w-5 h-5 text-red-500 drop-shadow-lg" />
-                           <div className="absolute right-0 top-6 w-48 bg-red-900/95 border border-red-700 rounded-lg p-2 text-xs text-red-100 opacity-0 group-hover/error:opacity-100 transition-opacity pointer-events-none shadow-lg">
-                             {frame.imageError}
+                           <div className="absolute right-0 top-6 w-56 bg-red-900/95 border border-red-700 rounded-lg p-2 text-xs text-red-100 opacity-0 group-hover/error:opacity-100 transition-opacity pointer-events-none shadow-lg whitespace-pre-wrap break-words">
+                             {frame.videoError || frame.imageError}
                            </div>
                          </div>
                        )}
@@ -6874,8 +7723,9 @@ const App: React.FC = () => {
                           {frame.imageUrl && (
                               <button
                                 onClick={() => handleGenerateFrameVideo(frame.id)}
-                                className="bg-purple-600 hover:bg-purple-500 text-white p-2 rounded-full shadow-lg flex items-center justify-center"
-                                title="生成视频"
+                                disabled={frame.isGeneratingVideo || frame.videoTaskStatus === 'waiting'}
+                                className="bg-purple-600 hover:bg-purple-500 disabled:bg-purple-900/60 disabled:text-purple-300/60 text-white p-2 rounded-full shadow-lg flex items-center justify-center"
+                                title={frame.videoTaskStatus === 'waiting' ? '视频队列等待中' : '生成视频'}
                               >
                                 <Film size={20} />
                               </button>
@@ -6883,8 +7733,9 @@ const App: React.FC = () => {
                           {!frame.imageUrl && currentProject.settings.multiRefVideoMode && (
                               <button
                                 onClick={() => handleGenerateFrameVideo(frame.id)}
-                                className="bg-purple-600 hover:bg-purple-500 text-white p-2 rounded-full shadow-lg flex items-center justify-center"
-                                title="多参考生成视频"
+                                disabled={frame.isGeneratingVideo || frame.videoTaskStatus === 'waiting'}
+                                className="bg-purple-600 hover:bg-purple-500 disabled:bg-purple-900/60 disabled:text-purple-300/60 text-white p-2 rounded-full shadow-lg flex items-center justify-center"
+                                title={frame.videoTaskStatus === 'waiting' ? '视频队列等待中' : '多参考生成视频'}
                               >
                                 <Film size={20} />
                               </button>
@@ -6898,6 +7749,11 @@ const App: React.FC = () => {
 
                        {/* Reference Indicators */}
                        <div className="absolute bottom-2 left-2 flex gap-1 pointer-events-none">
+                          {frame.videoUrl && (
+                            <div className="bg-purple-600/70 px-1.5 py-0.5 rounded text-[10px] text-white flex items-center gap-1 border border-purple-400/40" title="视频已生成">
+                               <Film size={8} /> 视频
+                            </div>
+                          )}
                           {frame.references.characterIds.length > 0 && (
                             <div className="bg-black/60 px-1.5 py-0.5 rounded text-[10px] text-blue-300 flex items-center gap-1 border border-blue-500/30" title="Uses Character Reference">
                                <Users size={8} /> {frame.references.characterIds.length}
@@ -7080,10 +7936,16 @@ const App: React.FC = () => {
                         })()}
                         
                          {/* Loading Overlay */}
-                         {(currentEpisode.frames[currentPlaybackIndex]?.isGeneratingVideo) && (
+                         {(currentEpisode.frames[currentPlaybackIndex]?.isGeneratingVideo || currentEpisode.frames[currentPlaybackIndex]?.videoTaskStatus === 'waiting') && (
                             <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center z-20">
-                                <Loader2 className="animate-spin text-purple-500 w-10 h-10 mb-2"/>
-                                <span className="text-white font-medium">正在生成视频...</span>
+                                <Loader2 className={`w-10 h-10 mb-2 ${currentEpisode.frames[currentPlaybackIndex]?.videoTaskStatus === 'waiting' ? 'text-yellow-400' : 'animate-spin text-purple-500'}`}/>
+                                <span className="text-white font-medium">{currentEpisode.frames[currentPlaybackIndex]?.videoTaskStatus === 'waiting' ? (currentEpisode.frames[currentPlaybackIndex]?.videoQueuePosition ? `队列等待中 · 前面还有 ${Math.max((currentEpisode.frames[currentPlaybackIndex]?.videoQueuePosition ?? 1) - 1, 0)} 个` : '队列等待中...') : '正在生成视频...'}</span>
+                            </div>
+                         )}
+
+                         {currentEpisode.frames[currentPlaybackIndex]?.videoError && (
+                            <div className="absolute top-16 left-4 right-4 bg-red-900/85 border border-red-700 rounded-lg px-3 py-2 text-red-100 text-xs z-20 whitespace-pre-wrap break-words">
+                              {currentEpisode.frames[currentPlaybackIndex]?.videoError}
                             </div>
                          )}
 
@@ -7104,11 +7966,12 @@ const App: React.FC = () => {
                          {/* Generate Video Action (If Image Exists but No Video) */}
                          {currentEpisode.frames[currentPlaybackIndex]?.imageUrl && !currentEpisode.frames[currentPlaybackIndex]?.videoUrl && !currentEpisode.frames[currentPlaybackIndex]?.isGeneratingVideo && (
                             <div className="absolute bottom-20 right-8 z-10">
-                                <button 
+                                <button
                                     onClick={() => handleGenerateFrameVideo(currentEpisode.frames[currentPlaybackIndex].id)}
-                                    className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded-full shadow-xl flex items-center gap-2 font-medium transition-all hover:scale-105"
+                                    disabled={currentEpisode.frames[currentPlaybackIndex]?.videoTaskStatus === 'waiting'}
+                                    className="bg-purple-600 hover:bg-purple-500 disabled:bg-purple-900/60 disabled:text-purple-300/60 text-white px-4 py-2 rounded-full shadow-xl flex items-center gap-2 font-medium transition-all hover:scale-105"
                                 >
-                                    <Film size={18} /> 生成视频
+                                    <Film size={18} /> {currentEpisode.frames[currentPlaybackIndex]?.videoTaskStatus === 'waiting' ? '视频排队中' : '生成视频'}
                                 </button>
                             </div>
                          )}
@@ -7175,12 +8038,21 @@ const App: React.FC = () => {
                                     </div>
                                 )}
 
-                                {frame.videoUrl && (
+                                {frame.videoUrl && !frame.isGeneratingVideo && frame.videoTaskStatus !== 'waiting' && (
                                     <div className="absolute top-1 left-1 bg-purple-600 rounded-full p-1 shadow-md z-10">
                                         <Film size={10} className="text-white"/>
                                     </div>
                                 )}
-                                
+
+                                {(frame.isGeneratingVideo || frame.videoTaskStatus === 'waiting') && (
+                                    <div className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-1 z-10">
+                                        <Loader2 size={18} className={frame.videoTaskStatus === 'waiting' ? 'text-yellow-300' : 'animate-spin text-purple-300'} />
+                                        <span className={`text-[10px] font-medium ${frame.videoTaskStatus === 'waiting' ? 'text-yellow-200' : 'text-purple-200'}`}>
+                                            {frame.videoTaskStatus === 'waiting' ? (frame.videoQueuePosition ? `等待中·前${Math.max(frame.videoQueuePosition - 1, 0)}个` : '队列等待中') : frame.videoProgress !== undefined ? `视频 ${Math.round(frame.videoProgress)}%` : '视频生成中'}
+                                        </span>
+                                    </div>
+                                )}
+
                                 <div className="absolute bottom-1 right-1 bg-black/60 text-white text-[10px] px-1.5 py-0.5 rounded backdrop-blur-sm">
                                     #{index + 1}
                                 </div>
@@ -7434,6 +8306,115 @@ const App: React.FC = () => {
             }}
             onClose={() => setShowGlobalSettingsModal(false)}
           />
+        )}
+
+        {/* 单集预处理配置 Modal */}
+        {showEpisodePreprocessModal && (
+          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+            <div className="bg-gray-800 rounded-2xl w-full max-w-md border border-gray-700 shadow-2xl">
+              <div className="p-5 border-b border-gray-700 flex justify-between items-center">
+                <h2 className="text-xl font-bold flex items-center gap-2">
+                  <Wand2 size={18} className="text-teal-400" /> 单集预处理
+                </h2>
+                <button
+                  onClick={() => setShowEpisodePreprocessModal(false)}
+                  disabled={isEpisodePreprocessing}
+                  className="text-gray-400 hover:text-white disabled:opacity-50"
+                >
+                  <X size={24} />
+                </button>
+              </div>
+              <div className="p-6 flex flex-col gap-4">
+                <div className="bg-gray-900 rounded-lg p-4 border border-gray-700">
+                  <p className="text-sm text-gray-300">
+                    当前分集：<span className="text-teal-300 font-medium">{currentEpisode.name}</span>
+                  </p>
+                  <p className="text-xs text-gray-500 mt-1">共 {currentEpisode.scriptContent.length.toLocaleString()} 字</p>
+                </div>
+                <p className="text-xs text-gray-500">仅对当前分集文本执行导演分段，不提取资产。分段完成后将展示预览供你确认。</p>
+                {(() => {
+                  const typePrompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
+                  const hasSecondPassPrompt = !!typePrompts.preprocessSecondPassPrompt?.trim();
+                  return (
+                    <label className={`flex items-center gap-2 select-none ${hasSecondPassPrompt ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'}`}>
+                      <input
+                        type="checkbox"
+                        checked={enableEpisodeSecondPass}
+                        onChange={e => setEnableEpisodeSecondPass(e.target.checked)}
+                        disabled={!hasSecondPassPrompt || isEpisodePreprocessing}
+                        className="accent-teal-500 w-4 h-4"
+                      />
+                      <span className="text-sm text-gray-300">启用二次加工</span>
+                      {!hasSecondPassPrompt && <span className="text-xs text-gray-500">（请先配置二次加工提示词）</span>}
+                    </label>
+                  );
+                })()}
+              </div>
+              <div className="p-5 border-t border-gray-700 flex justify-end gap-3">
+                <button
+                  onClick={() => setShowEpisodePreprocessModal(false)}
+                  disabled={isEpisodePreprocessing}
+                  className="px-5 py-2.5 rounded-lg text-gray-300 hover:bg-gray-700 font-medium disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleEpisodePreprocess}
+                  disabled={isEpisodePreprocessing}
+                  className="px-6 py-2.5 bg-teal-600 hover:bg-teal-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-white font-medium flex items-center gap-2 transition-colors"
+                >
+                  {isEpisodePreprocessing ? <><Loader2 size={16} className="animate-spin" /> 处理中...</> : '开始预处理'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 单集预处理结果预览 Modal */}
+        {showEpisodePreprocessPreview && episodePreprocessResult !== null && (
+          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+            <div className="bg-gray-800 rounded-2xl w-full max-w-2xl border border-gray-700 shadow-2xl flex flex-col max-h-[90vh]">
+              <div className="p-5 border-b border-gray-700 flex justify-between items-center">
+                <h2 className="text-xl font-bold flex items-center gap-2">
+                  <FileText size={18} className="text-teal-400" /> 预处理结果预览
+                </h2>
+                <button
+                  onClick={() => { setShowEpisodePreprocessPreview(false); setEpisodePreprocessResult(null); }}
+                  className="text-gray-400 hover:text-white"
+                >
+                  <X size={24} />
+                </button>
+              </div>
+              <div className="p-5 flex-1 overflow-hidden flex flex-col gap-3">
+                <p className="text-xs text-gray-400">
+                  共 {episodePreprocessResult.length.toLocaleString()} 字。确认后将替换「{currentEpisode.name}」的剧本内容。
+                </p>
+                <textarea
+                  readOnly
+                  value={episodePreprocessResult}
+                  className="flex-1 w-full bg-gray-900 border border-gray-700 rounded-xl p-4 text-gray-200 resize-none font-serif text-sm leading-relaxed custom-scrollbar focus:outline-none"
+                />
+              </div>
+              <div className="p-5 border-t border-gray-700 flex justify-end gap-3">
+                <button
+                  onClick={() => { setShowEpisodePreprocessPreview(false); setEpisodePreprocessResult(null); }}
+                  className="px-5 py-2.5 rounded-lg text-gray-300 hover:bg-gray-700 font-medium"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={() => {
+                    handleUpdateEpisode(currentProject.id, currentEpisode.id, { scriptContent: episodePreprocessResult! });
+                    setShowEpisodePreprocessPreview(false);
+                    setEpisodePreprocessResult(null);
+                  }}
+                  className="px-6 py-2.5 bg-teal-600 hover:bg-teal-500 rounded-lg text-white font-medium flex items-center gap-2 transition-colors"
+                >
+                  确认替换
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </>
     );

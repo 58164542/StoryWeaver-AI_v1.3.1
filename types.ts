@@ -24,6 +24,7 @@ export interface ProjectTypeInstruction {
   sceneExtraction: string;       // 场景提取提示词
   storyboardBreakdown: string;   // 分镜拆解提示词
   preprocessSegmentPrompt: string; // 小说预处理分段提示词
+  preprocessSecondPassPrompt?: string; // 预处理二次加工提示词（可选）
 }
 
 export interface GlobalSettings {
@@ -41,7 +42,7 @@ export interface GlobalSettings {
 export interface SeedanceSession {
   id: string;
   name: string;
-  status: 'active' | 'expired' | 'insufficient' | 'disabled';
+  status: 'active' | 'expired' | 'insufficient' | 'disabled' | 'security_check';
   credits: number | null;
   lastUsed: number;
   currentTasks: number;
@@ -134,6 +135,10 @@ export interface StoryboardFrame {
   imageProgress?: number;  // 0-100
   videoProgress?: number;  // 0-100
   audioProgress?: number;  // 0-100
+  videoTaskStatus?: 'waiting' | 'loading'; // 视频任务状态：排队中/生成中
+  videoQueuePosition?: number; // 视频任务在队列中的位置（从 1 开始，不含当前运行中的任务）
+  seedanceTaskId?: string; // Seedance 微服务任务 ID，用于刷新/重启后恢复轮询
+  seedanceTaskUpdatedAt?: number; // 最近一次 Seedance 任务状态更新时间
   imageError?: string;     // 图片生成错误
   videoError?: string;     // 视频生成错误
   audioError?: string;     // 音频生成错误

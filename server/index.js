@@ -11,6 +11,8 @@ import mediaRouter from './routes/media.js';
 import ttsRouter from './routes/tts.js';
 import jianyingRouter from './routes/jianying.js';
 import klingRouter from './routes/kling.js';
+import seedanceSessionsRouter from './routes/seedance-sessions.js';
+import claudeRouter from './routes/claude.js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { readFile } from 'fs/promises';
@@ -38,6 +40,8 @@ app.use('/api/media', mediaRouter);
 app.use('/api/tts', ttsRouter);
 app.use('/api/jianying', jianyingRouter);
 app.use('/api/kling', klingRouter);
+app.use('/api/seedance-sessions', seedanceSessionsRouter);
+app.use('/api/claude', claudeRouter);
 
 app.get('/api/system-prompts/segment-skill', async (req, res) => {
   try {

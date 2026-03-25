@@ -25,6 +25,7 @@ data/db.json
 data/media/
 data/exports/
 data/recycle_bin/
+server/seedance/data/
 
 # Local reference and test assets
 参考图/

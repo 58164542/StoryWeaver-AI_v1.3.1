@@ -24,13 +24,14 @@ export interface TaskStatus {
   progress: number;
   status: 'queued' | 'running' | 'completed' | 'failed';
   error?: string;
+  queuePosition?: number;
 }
 
 type StatusListener = (statuses: Map<string, TaskStatus>) => void;
 
 class TaskQueueManager {
   private maxConcurrent: number = 5;
-  private maxConcurrentVideo: number = 10; // 视频生成并发数
+  private maxConcurrentVideo: number = Infinity; // 视频生成并发数（无限制，由后端单账号并发控制）
   private queue: Task[] = [];
   private running: Map<string, Task> = new Map();
   private statuses: Map<string, TaskStatus> = new Map();
@@ -131,8 +132,20 @@ class TaskQueueManager {
    * 通知所有监听器
    */
   private notifyListeners(): void {
+    const snapshot = new Map(this.statuses);
+
+    let videoQueueIndex = 0;
+    for (const task of this.queue) {
+      if (task.type !== 'video') continue;
+      videoQueueIndex += 1;
+      const status = snapshot.get(task.id);
+      if (status) {
+        status.queuePosition = videoQueueIndex;
+      }
+    }
+
     this.listeners.forEach(listener => {
-      listener(new Map(this.statuses));
+      listener(snapshot);
     });
   }
 

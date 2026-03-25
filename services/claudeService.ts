@@ -1,39 +1,102 @@
 /**
- * Claude 服务 - 通过 Univibe Anthropic 兼容端点调用 claude-sonnet-4-6
- * 端点：https://api.univibe.cc/anthropic/v1/messages
- * 注意：使用 Anthropic Messages 协议；资产提取强制纯 JSON；分段使用流式 SSE
+ * Claude 服务 - 通过本地后端代理调用 claude-sonnet-4-6（避免 CORS 问题）
+ * 支持的上游端点（由后端 server/routes/claude.js 代理）：
+ * - Univibe: https://api.univibe.cc/anthropic/v1/messages
+ * - 柏拉图中转: https://api.bltcy.ai/v1/messages
+ *
+ * 注意：API Key 存放在后端 process.env，前端不持有任何密钥
  */
 
-import { AnalysisResult } from '../types';
+import { AnalysisResult, StoryboardBreakdown, StoryboardDialogueLine } from '../types';
 import { Logger } from '../utils/logger';
 
-const CLAUDE_API_URL = 'https://api.univibe.cc/anthropic/v1/messages';
+export type ClaudeProviderType = 'univibe' | 'bltcy';
+
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
-const ANTHROPIC_VERSION = '2023-06-01';
 const CLAUDE_THINKING_BUDGET_TOKENS = 4096;
 
-function getApiKey(): string {
-  const env = import.meta.env as Record<string, string | undefined>;
-  const key = env.VITE_UNIVIBE_API_KEY
-    || env.UNIVIBE_API_KEY
-    || env.univibe_api_key
-    || process.env.UNIVIBE_API_KEY
-    || process.env.univibe_api_key;
-
-  if (!key || key === 'PLACEHOLDER_API_KEY') {
-    throw new Error('请在 .env.local 中配置 VITE_UNIVIBE_API_KEY（或 UNIVIBE_API_KEY / univibe_api_key）');
+/** 本地后端代理地址（与 apiService.ts 中的 API_BASE_URL 逻辑一致） */
+function getProxyUrl(): string {
+  const configuredUrl = (import.meta as any).env?.VITE_API_URL;
+  if (configuredUrl) return `${configuredUrl}/api/claude/proxy`;
+  if (typeof window !== 'undefined') {
+    return `${window.location.protocol}//${window.location.hostname}:3001/api/claude/proxy`;
   }
-
-  return key;
+  return 'http://localhost:3001/api/claude/proxy';
 }
 
-function buildHeaders(apiKey: string, stream = false): HeadersInit {
-  return {
-    'x-api-key': apiKey,
-    'anthropic-version': ANTHROPIC_VERSION,
-    'Content-Type': 'application/json',
-    'Accept': stream ? 'text/event-stream' : 'application/json',
-  };
+// 全局状态：当前使用的 Claude 提供商
+let currentClaudeProvider: ClaudeProviderType = 'univibe';
+
+export function setClaudeProvider(provider: ClaudeProviderType) {
+  console.log(`🔄 切换 Claude 提供商: ${currentClaudeProvider} → ${provider}`);
+  currentClaudeProvider = provider;
+}
+
+export function getCurrentClaudeProvider(): ClaudeProviderType {
+  return currentClaudeProvider;
+}
+
+const CLAUDE_CONNECTIVITY_TIMEOUT_MS = 15000;
+
+/**
+ * 检查指定 Claude 提供商的网络连通性
+ * 发送一个最小请求（max_tokens=1），在超时内收到任何非网络错误响应即视为连通
+ */
+export async function checkClaudeConnectivity(
+  provider: ClaudeProviderType,
+  timeoutMs: number = CLAUDE_CONNECTIVITY_TIMEOUT_MS
+): Promise<{ ok: boolean; error?: string }> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  const providerName = provider === 'univibe' ? 'Univibe' : '柏拉图中转';
+
+  try {
+    const response = await fetch(getProxyUrl(), {
+      method: 'POST',
+      headers: buildProxyHeaders(),
+      body: JSON.stringify({
+        provider,
+        model: CLAUDE_MODEL,
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'ping' }],
+      }),
+      signal: controller.signal,
+    });
+
+    // 任何 HTTP 响应（包括 4xx）都说明网络连通，只有 5xx 才视为不可用
+    if (response.status < 500) {
+      return { ok: true };
+    }
+
+    const errorText = await response.text().catch(() => '');
+    return {
+      ok: false,
+      error: `${providerName} Claude 服务不可用（${response.status}）: ${errorText.slice(0, 200) || response.statusText}`,
+    };
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      return { ok: false, error: `${providerName} Claude 连通性检测超时（>${timeoutMs}ms）` };
+    }
+    return { ok: false, error: `${providerName} Claude 连通性检测失败: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/** 后端代理请求头（不含 API Key，provider 通过 body 传递） */
+function buildProxyHeaders(): HeadersInit {
+  return { 'Content-Type': 'application/json' };
+}
+
+function assertNotHtmlResponse(contentType: string | null, preview: string, label: string): void {
+  const isHtml = (contentType && contentType.includes('text/html'))
+    || /^<!DOCTYPE html>/i.test(preview.trimStart())
+    || /^<html[\s>]/i.test(preview.trimStart());
+  if (isHtml) {
+    throw new Error(`${label} 返回了 HTML 而不是 JSON/SSE（可能是 URL 配置错误或中转服务异常）: ${preview.slice(0, 200)}`);
+  }
 }
 
 function buildThinkingConfig() {
@@ -183,9 +246,10 @@ export async function segmentEpisodeWithClaude(
   episodeText: string,
   skillContent: string,
   debugLabel = '未命名分集',
-  promptContext?: Omit<ChapterPreprocessPromptContext, 'chapterText'>
+  promptContext?: Omit<ChapterPreprocessPromptContext, 'chapterText'>,
+  provider?: ClaudeProviderType
 ): Promise<SegmentEpisodeResult> {
-  const apiKey = getApiKey();
+  const providerType = provider || currentClaudeProvider;
 
   const renderedPrompt = renderChapterPreprocessPrompt(skillContent, {
     chapterText: episodeText,
@@ -193,10 +257,10 @@ export async function segmentEpisodeWithClaude(
   });
 
   const payload = {
+    provider: providerType,
     model: CLAUDE_MODEL,
     temperature: 0,
     max_tokens: 30000,
-    thinking: buildThinkingConfig(),
     stream: true,
     system: renderedPrompt,
     messages: [
@@ -215,9 +279,9 @@ export async function segmentEpisodeWithClaude(
       console.log(sanitizeAnthropicLogValue(JSON.parse(JSON.stringify(payload))));
       console.groupEnd();
 
-      const response = await fetch(CLAUDE_API_URL, {
+      const response = await fetch(getProxyUrl(), {
         method: 'POST',
-        headers: buildHeaders(apiKey, true),
+        headers: buildProxyHeaders(),
         body: JSON.stringify(payload),
       });
 
@@ -229,6 +293,13 @@ export async function segmentEpisodeWithClaude(
         const errorText = await response.text();
         throw new Error(`分段 API 请求失败 (${response.status}): ${errorText.slice(0, 300)}`);
       }
+
+      // 防止 URL 配置错误时 200 HTML 响应被当成 SSE 处理
+      assertNotHtmlResponse(
+        response.headers.get('content-type'),
+        '',  // 流式响应不预读 body，仅检查 Content-Type
+        `[分段][${debugLabel}]`
+      );
 
       const reader = response.body?.getReader();
       if (!reader) {
@@ -280,7 +351,9 @@ export async function segmentEpisodeWithClaude(
       }
 
       if (stopReason === 'max_tokens') {
-        throw new Error(`分段输出被截断（stop_reason=max_tokens）：${debugLabel}`);
+        // 截断原因是上下文/输出超限，换相同 payload 重试必然复现，直接标记失败
+        console.error(`[分段][${debugLabel}] 输出被截断（max_tokens），不重试，回退为原始章节文本`);
+        return { content: episodeText, failed: true };
       }
 
       return {
@@ -299,7 +372,7 @@ export async function segmentEpisodeWithClaude(
     }
   }
 
-  return episodeText;
+  return { content: episodeText, failed: true };
 }
 
 /**
@@ -308,19 +381,23 @@ export async function segmentEpisodeWithClaude(
  */
 export async function analyzeNovelScriptWithClaude(
   scriptContent: string,
-  systemInstruction: string
+  systemInstruction: string,
+  provider?: ClaudeProviderType
 ): Promise<AnalysisResult> {
-  const apiKey = getApiKey();
+  const providerType = provider || currentClaudeProvider;
 
   const payload = {
+    provider: providerType,
     model: CLAUDE_MODEL,
     max_tokens: 30000,
-    thinking: buildThinkingConfig(),
     system: '你是一个结构化信息提取助手。无论用户提供什么文本，你只能输出纯JSON对象，不得包含任何markdown标记、代码块、解释文字、标题或换行注释。你的输出必须能被 JSON.parse() 直接解析。',
     messages: [
       {
         role: 'user',
-        content: `请从以下小说文本中提取角色、场景和变体信息。
+        content: `请提取这本小说中所有主要角色次要角色的外貌、衣着描写、角色别称（除了角色常规衣着以外，也区分角色不同衣着，创建不同的变体词条（常服不包括在内）。若原文无描述或模糊描述角色常服衣着，则根据身份和剧情定位进行适当原创）。不用输出表情、状态。
+        （对于 characters，提取角色完整基础形象，输出字段包含：name（名字，禁止括号注释）、aliases（脚本中出现的别名/别称列表）、description（描述）、appearance（完整基础形象：面部外貌、发型、体态 + 年龄、性别、身份气质 + 日常常服/默认服装；常服必须写入此字段，不得作为变体）、personality（性格）、role（角色类型：Protagonist/Antagonist/Supporting）。
+        对于 variants（角色服装/外貌变体）：【严格规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体XX"格式）。常服/日常装束/默认服装不得作为变体提取，应归入主体 appearance 字段。输出字段：characterName（对应角色的 name，必须完全匹配）、name（变体名）、context（出现场景）、appearance（变体专属外貌描述，包含衣着、配饰等具体细节）。
+        对于 scenes，包含：name（名字）、description（描述）、environment（环境，禁止出现任何剧情描述，只描述场景地点的布置和外观，去除所有有关小物件、场景人物、出现人物身份代词的描写，如果原文中缺乏描写酌情原创。）、atmosphere（氛围）。）
 
 【提取规则】
 ${systemInstruction}
@@ -339,9 +416,9 @@ ${scriptContent}`,
   console.log(sanitizeAnthropicLogValue(JSON.parse(JSON.stringify(payload))));
   console.groupEnd();
 
-  const response = await fetch(CLAUDE_API_URL, {
+  const response = await fetch(getProxyUrl(), {
     method: 'POST',
-    headers: buildHeaders(apiKey),
+    headers: buildProxyHeaders(),
     body: JSON.stringify(payload),
   });
 
@@ -355,6 +432,8 @@ ${scriptContent}`,
   if (!response.ok) {
     throw new Error(`Claude API 请求失败 (${response.status}): ${rawText}`);
   }
+
+  assertNotHtmlResponse(response.headers.get('content-type'), rawText, '[Claude 资产提取]');
 
   let data: any;
   try {
@@ -374,15 +453,30 @@ ${scriptContent}`,
   console.groupEnd();
 
   let jsonStr = content.trim();
-  const match = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (match) jsonStr = match[1].trim();
+  // 去除 markdown 代码块包裹
+  const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenceMatch) jsonStr = fenceMatch[1].trim();
 
   let parsed: any;
   try {
     parsed = JSON.parse(jsonStr);
-  } catch (e) {
-    console.error('[Claude] JSON.parse 失败，原始 content:', content);
-    throw new Error('Claude 返回的 JSON 格式无效: ' + (e as Error).message);
+  } catch {
+    // 兜底：提取第一个 { 到最后一个 } 之间的内容
+    const braceStart = jsonStr.indexOf('{');
+    const braceEnd = jsonStr.lastIndexOf('}');
+    if (braceStart !== -1 && braceEnd > braceStart) {
+      const extracted = jsonStr.slice(braceStart, braceEnd + 1);
+      try {
+        parsed = JSON.parse(extracted);
+        console.warn('[Claude] JSON 兜底提取成功（模型在 JSON 前后输出了多余文字）');
+      } catch (e2) {
+        console.error('[Claude] JSON.parse 兜底也失败，原始 content:', content);
+        throw new Error('Claude 返回的 JSON 格式无效: ' + (e2 as Error).message);
+      }
+    } else {
+      console.error('[Claude] JSON.parse 失败且未找到 {} 结构，原始 content:', content);
+      throw new Error('Claude 返回的内容不包含 JSON 对象');
+    }
   }
 
   const result: AnalysisResult = {
@@ -395,6 +489,132 @@ ${scriptContent}`,
     characters: result.characters.length,
     scenes: result.scenes.length,
     variants: result.variants?.length ?? 0,
+  });
+
+  return result;
+}
+
+/**
+ * 调用 claude-sonnet-4-6 生成分镜拆解
+ * system 强制纯 JSON 输出，分镜规则放入 user message
+ */
+export async function generateStoryboardBreakdownWithClaude(
+  scriptContent: string,
+  systemInstruction: string,
+  provider?: ClaudeProviderType
+): Promise<StoryboardBreakdown> {
+  const providerType = provider || currentClaudeProvider;
+
+  const payload = {
+    provider: providerType,
+    model: CLAUDE_MODEL,
+    max_tokens: 30000,
+    system: '你是一个分镜拆解助手。无论用户提供什么文本，你只能输出纯JSON对象，不得包含任何markdown标记、代码块、解释文字、标题或换行注释。你的输出必须能被 JSON.parse() 直接解析。',
+    messages: [
+      {
+        role: 'user',
+        content: `请将以下小说文本拆解为视觉分镜帧。
+
+【分镜规则】
+${systemInstruction}
+
+【必须严格遵守的输出格式】
+直接输出以下结构的JSON对象，不得有任何其他文字：
+{"frames":[{"imagePrompt":"静态画面描述","videoPrompt":"视频动作描述","dialogues":[{"speakerName":"角色名","text":"台词"}],"dialogue":"兼容字段","originalText":"原文片段","characterNames":["角色名"],"sceneNames":["场景名"],"variantNames":["变体名"]}]}
+
+【小说文本】
+${scriptContent.substring(0, 30000)}`,
+      },
+    ],
+  };
+
+  console.group('%c[Claude] 分镜拆解请求体', 'color: #a78bfa; font-weight: bold');
+  console.log(sanitizeAnthropicLogValue(JSON.parse(JSON.stringify(payload))));
+  console.groupEnd();
+
+  const response = await fetch(getProxyUrl(), {
+    method: 'POST',
+    headers: buildProxyHeaders(),
+    body: JSON.stringify(payload),
+  });
+
+  const rawText = await response.text();
+
+  console.group('%c[Claude] 分镜拆解响应体', 'color: #34d399; font-weight: bold');
+  console.log('status:', response.status);
+  console.log('raw text:', sanitizeAnthropicRawTextForLog(rawText));
+  console.groupEnd();
+
+  if (!response.ok) {
+    throw new Error(`Claude API 请求失败 (${response.status}): ${rawText}`);
+  }
+
+  assertNotHtmlResponse(response.headers.get('content-type'), rawText, '[Claude 分镜拆解]');
+
+  let data: any;
+  try {
+    data = JSON.parse(rawText);
+  } catch {
+    throw new Error(`Claude 响应不是合法 JSON: ${rawText.slice(0, 300)}`);
+  }
+
+  const content = extractTextFromMessageContent(data?.content);
+  if (!content) {
+    console.error('[Claude] 分镜拆解响应结构异常:', JSON.stringify(sanitizeAnthropicLogValue(data)));
+    throw new Error('Claude 分镜拆解响应中没有 content 文本块');
+  }
+
+  let jsonStr = content.trim();
+  const match = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (match) jsonStr = match[1].trim();
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(jsonStr);
+  } catch (e) {
+    console.error('[Claude] 分镜拆解 JSON.parse 失败，原始 content:', content);
+    throw new Error('Claude 返回的分镜 JSON 格式无效: ' + (e as Error).message);
+  }
+
+  const frames = Array.isArray(parsed.frames) ? parsed.frames : Array.isArray(parsed) ? parsed : [];
+
+  const result: StoryboardBreakdown = {
+    frames: frames.map((f: any) => {
+      const imagePrompt = typeof f.imagePrompt === 'string' ? f.imagePrompt : (f.prompt ?? '');
+      const videoPrompt = typeof f.videoPrompt === 'string' ? f.videoPrompt : (f.prompt ?? '');
+
+      // dialogues 兼容
+      let dialogues: StoryboardDialogueLine[] | undefined = undefined;
+      let dialogue: string | undefined = f.dialogue;
+      if (Array.isArray(f.dialogues) && f.dialogues.length > 0) {
+        dialogues = f.dialogues;
+        dialogue = f.dialogues
+          .map((d: any) => {
+            const speaker = String(d.speakerName ?? '').trim();
+            const text = String(d.text ?? '').trim();
+            if (!text) return '';
+            return speaker ? `${speaker}：${text}` : text;
+          })
+          .filter(Boolean)
+          .join('\n');
+      }
+
+      return {
+        imagePrompt,
+        videoPrompt,
+        dialogues,
+        dialogue,
+        originalText: f.originalText ?? '',
+        characterNames: f.characterNames,
+        variantNames: f.variantNames,
+        sceneNames: f.sceneNames,
+        sceneName: f.sceneName,
+      };
+    }),
+  };
+
+  Logger.logInfo('Claude 分镜拆解完成', {
+    framesCount: result.frames.length,
   });
 
   return result;

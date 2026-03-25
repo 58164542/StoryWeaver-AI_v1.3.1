@@ -75,7 +75,15 @@ async function saveExternalMediaCore(externalUrl, filename, hint) {
     throw new Error('仅支持 http/https 媒体地址');
   }
 
-  const response = await fetch(trimmed);
+  // 即梦/字节 CDN 需要 User-Agent 和 Referer，否则返回 500
+  const fetchHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+  };
+  if (/jimeng\.com|dreamnia|byteimg\.com|bytedance/i.test(trimmed)) {
+    fetchHeaders['Referer'] = 'https://jimeng.jianying.com/';
+  }
+
+  const response = await fetch(trimmed, { headers: fetchHeaders });
   if (!response.ok) {
     throw new Error(`拉取外部媒体失败 (${response.status})`);
   }

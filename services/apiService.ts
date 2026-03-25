@@ -2,10 +2,43 @@
  * 前端 API 服务 - 与后端通信
  */
 
-// API 基础 URL（开发环境默认使用 localhost:3001）
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+function resolveApiBaseUrl() {
+  const configuredUrl = import.meta.env.VITE_API_URL || process.env.VITE_API_URL;
+  if (configuredUrl) {
+    return configuredUrl;
+  }
 
-function toAbsoluteApiUrl(url: string) {
+  if (typeof window !== 'undefined') {
+    return `${window.location.protocol}//${window.location.hostname}:3001`;
+  }
+
+  return 'http://localhost:3001';
+}
+
+function resolveSeedanceApiUrl() {
+  const configuredUrl = import.meta.env.VITE_SEEDANCE_API_URL || process.env.SEEDANCE_API_URL;
+  if (configuredUrl) {
+    return configuredUrl;
+  }
+
+  try {
+    const apiUrl = new URL(
+      API_BASE_URL,
+      typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000'
+    );
+    return `${apiUrl.protocol}//${apiUrl.hostname}:3005`;
+  } catch {
+    if (typeof window !== 'undefined') {
+      return `${window.location.protocol}//${window.location.hostname}:3005`;
+    }
+    return 'http://localhost:3005';
+  }
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
+export const SEEDANCE_API_URL = resolveSeedanceApiUrl();
+
+export function toAbsoluteApiUrl(url: string) {
   if (!url) return url;
   if (/^https?:\/\//i.test(url)) return url;
   return `${API_BASE_URL}${url}`;
@@ -193,13 +226,6 @@ export async function getSettings() {
 }
 
 /**
- * 实时读取分段 system prompt
- */
-export async function getSegmentSkillPrompt() {
-  return request('/api/system-prompts/segment-skill');
-}
-
-/**
  * 更新全局设置
  */
 export async function updateSettings(settings: any) {
@@ -308,6 +334,71 @@ export async function exportProjectAssetImagesZip(projectId: string) {
   };
 }
 
+// ==================== Seedance Session API ====================
+
+export async function getSeedanceSessions() {
+  return request('/api/seedance-sessions');
+}
+
+export async function addSeedanceSession(sessionId: string, name: string) {
+  return request('/api/seedance-sessions', {
+    method: 'POST',
+    body: JSON.stringify({ sessionId, name }),
+  });
+}
+
+export async function updateSeedanceSession(id: string, updates: any) {
+  return request(`/api/seedance-sessions/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(updates),
+  });
+}
+
+export async function deleteSeedanceSession(id: string) {
+  return request(`/api/seedance-sessions/${id}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function querySeedanceSessionCredits(id: string) {
+  const response = await fetch(`${SEEDANCE_API_URL}/api/sessions/${id}/query-credits`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data?.error || `HTTP ${response.status}`);
+  }
+  return data.data;
+}
+
+export async function getSeedanceSessionsStatus() {
+  const result = await request('/api/seedance-sessions');
+  return result?.data || result;
+}
+
+export async function resetInsufficientSessions() {
+  return request('/api/seedance-sessions/reset-insufficient', { method: 'POST' });
+}
+
+export async function syncSeedanceSessions() {
+  // 通知微服务从中心后端刷新缓存
+  try {
+    const response = await fetch(`${SEEDANCE_API_URL}/api/sessions/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data?.error || `HTTP ${response.status}`);
+    }
+    return data.data;
+  } catch {
+    // 微服务不可达时静默失败，不影响中心后端操作
+    return null;
+  }
+}
+
 // ==================== 健康检查 ====================
 
 /**
@@ -338,6 +429,26 @@ export async function updateFrameTextFields(
   });
 }
 
+/**
+ * 根据项目类型获取分段预处理提示词
+ */
+export async function getSegmentSkillPrompt(projectType?: string) {
+  const settings = await getSettings();
+  const type = projectType || 'REAL_PERSON_COMMENTARY';
+  const prompts = settings.projectTypePrompts?.[type];
+
+  if (!prompts) {
+    throw new Error(`未找到项目类型 ${type} 的提示词配置`);
+  }
+
+  const content = prompts.preprocessSegmentPrompt;
+  if (!content) {
+    throw new Error(`项目类型 ${type} 的分段预处理提示词为空`);
+  }
+
+  return { content };
+}
+
 export default {
   getAllProjects,
   getProject,
@@ -349,7 +460,6 @@ export default {
   updateEpisode,
   deleteProject,
   getSettings,
-  getSegmentSkillPrompt,
   updateSettings,
   uploadMedia,
   saveExternalVideo,
@@ -358,5 +468,14 @@ export default {
   getMediaUrl,
   exportEpisodeStoryboardImagesZip,
   exportProjectAssetImagesZip,
+  getSeedanceSessions,
+  addSeedanceSession,
+  updateSeedanceSession,
+  deleteSeedanceSession,
+  querySeedanceSessionCredits,
+  getSeedanceSessionsStatus,
+  resetInsufficientSessions,
+  syncSeedanceSessions,
   checkHealth,
+  getSegmentSkillPrompt,
 };
