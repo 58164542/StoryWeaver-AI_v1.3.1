@@ -166,6 +166,42 @@ export async function updateEpisode(projectId: string, episodeId: string, episod
   });
 }
 
+// ==================== 分集回收站 API ====================
+
+/**
+ * 软删除分集（移入项目分集回收站）
+ */
+export async function deleteEpisode(projectId: string, episodeId: string) {
+  return request(`/api/projects/${projectId}/episodes/${episodeId}`, {
+    method: 'DELETE',
+  });
+}
+
+/**
+ * 获取项目的分集回收站列表
+ */
+export async function getEpisodeRecycleBin(projectId: string) {
+  return request(`/api/projects/${projectId}/episode-recycle-bin`);
+}
+
+/**
+ * 恢复回收站中的分集
+ */
+export async function restoreEpisode(projectId: string, episodeId: string) {
+  return request(`/api/projects/${projectId}/episode-recycle-bin/${episodeId}/restore`, {
+    method: 'POST',
+  });
+}
+
+/**
+ * 永久删除回收站中的分集
+ */
+export async function deleteEpisodePermanently(projectId: string, episodeId: string) {
+  return request(`/api/projects/${projectId}/episode-recycle-bin/${episodeId}`, {
+    method: 'DELETE',
+  });
+}
+
 /**
  * 删除项目
  */
@@ -377,6 +413,12 @@ export async function getSeedanceSessionsStatus() {
   return result?.data || result;
 }
 
+export async function getSeedanceSessionFullById(id: string): Promise<string | null> {
+  const result = await request('/api/seedance-sessions/full');
+  const sessions: Array<{ id: string; sessionId: string }> = result?.data || result || [];
+  return sessions.find(s => s.id === id)?.sessionId ?? null;
+}
+
 export async function resetInsufficientSessions() {
   return request('/api/seedance-sessions/reset-insufficient', { method: 'POST' });
 }
@@ -429,6 +471,37 @@ export async function updateFrameTextFields(
   });
 }
 
+export async function recordProjectTextUsage(
+  projectId: string,
+  payload: {
+    provider: string;
+    model: string;
+    taskType: string;
+    idempotencyKey: string;
+    usage: any;
+  }
+) {
+  return request(`/api/projects/${projectId}/stats/text-usage`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateFrameVideo(
+  projectId: string,
+  episodeId: string,
+  frameId: string,
+  payload: {
+    videoUrl: string;
+    videoDuration?: number;
+  }
+) {
+  return request(`/api/projects/${projectId}/frames/${frameId}/video`, {
+    method: 'PATCH',
+    body: JSON.stringify({ episodeId, ...payload }),
+  });
+}
+
 /**
  * 根据项目类型获取分段预处理提示词
  */
@@ -449,6 +522,58 @@ export async function getSegmentSkillPrompt(projectType?: string) {
   return { content };
 }
 
+export async function createNovelPreprocessTask(payload: {
+  projectId: string;
+  projectType?: string;
+  novelText: string;
+  episodeDrafts: Array<{ title: string; content: string }>;
+  systemInstruction: string;
+  segmentPrompt: string;
+  secondPassPrompt?: string;
+  enableSecondPass?: boolean;
+}) {
+  return request('/api/preprocess/novel', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function createEpisodePreprocessTask(payload: {
+  projectId: string;
+  episodeId: string;
+  episodeName: string;
+  content: string;
+  segmentPrompt: string;
+  secondPassPrompt?: string;
+  enableSecondPass?: boolean;
+}) {
+  return request('/api/preprocess/episode', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getPreprocessTask(taskId: string) {
+  return request(`/api/preprocess/tasks/${taskId}`);
+}
+
+export async function listPreprocessTasks(projectId?: string) {
+  const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+  return request(`/api/preprocess/tasks${query}`);
+}
+
+export async function markPreprocessTaskApplied(taskId: string) {
+  return request(`/api/preprocess/tasks/${taskId}/applied`, {
+    method: 'POST',
+  });
+}
+
+export async function deletePreprocessTask(taskId: string) {
+  return request(`/api/preprocess/tasks/${taskId}`, {
+    method: 'DELETE',
+  });
+}
+
 export default {
   getAllProjects,
   getProject,
@@ -458,6 +583,10 @@ export default {
   updateProjectSettings,
   updateProjectAssets,
   updateEpisode,
+  deleteEpisode,
+  getEpisodeRecycleBin,
+  restoreEpisode,
+  deleteEpisodePermanently,
   deleteProject,
   getSettings,
   updateSettings,
@@ -474,8 +603,17 @@ export default {
   deleteSeedanceSession,
   querySeedanceSessionCredits,
   getSeedanceSessionsStatus,
+  getSeedanceSessionFullById,
   resetInsufficientSessions,
   syncSeedanceSessions,
   checkHealth,
+  recordProjectTextUsage,
+  updateFrameVideo,
   getSegmentSkillPrompt,
+  createNovelPreprocessTask,
+  createEpisodePreprocessTask,
+  getPreprocessTask,
+  listPreprocessTasks,
+  markPreprocessTaskApplied,
+  deletePreprocessTask,
 };

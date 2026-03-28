@@ -93,6 +93,73 @@ let taskCounter = 0;
 
 const TASK_MEMORY_TTL = 30 * 60 * 1000; // 任务完成后在内存中保留 30 分钟
 
+// ============================================================
+// 全局 Session 等待队列
+//   场景1：所有 session 并发满 → 任务排队等 release 通知
+//   场景2：1310/4010 高峰冷却 → 任务排队等冷却结束后逐个唤醒
+// ============================================================
+const waitQueue = []; // Array<() => void>  每项是一个 resolve 函数
+let peakCooldownEnd = 0;    // 高峰期冷却结束时间戳（0 = 无冷却）
+let peakCooldownTimer = null; // 冷却定时器句柄
+
+/** 唤醒等待队列中的前 count 个任务（默认 1 个） */
+function drainWaitQueue(count = 1) {
+  for (let i = 0; i < count && waitQueue.length > 0; i++) {
+    waitQueue.shift()();
+  }
+}
+
+/**
+ * 触发高峰期冷却：waitMinutes 分钟后逐个（每 2 秒）唤醒等待任务
+ * 已在冷却中时调用无效（不重置计时器）
+ */
+function triggerPeakCooldown(waitMinutes = 10) {
+  if (peakCooldownTimer) return; // 已在冷却中，忽略重复触发
+  peakCooldownEnd = Date.now() + waitMinutes * 60 * 1000;
+  console.log(`[peak-cooldown] 高峰期限流，${waitMinutes} 分钟后逐个重试 (当前 ${waitQueue.length} 个任务排队)`);
+  peakCooldownTimer = setTimeout(() => {
+    peakCooldownEnd = 0;
+    peakCooldownTimer = null;
+    // 逐个唤醒，每 2 秒一个，避免同时重放造成再次 1310
+    function notifyNext() {
+      if (waitQueue.length > 0) {
+        drainWaitQueue(1);
+        if (waitQueue.length > 0) setTimeout(notifyNext, 2000);
+      }
+    }
+    notifyNext();
+  }, waitMinutes * 60 * 1000);
+}
+
+/**
+ * 带排队的 acquire：
+ * - 高峰冷却期内：进入 waitQueue 等待冷却结束
+ * - 所有 session 并发满（503）：进入 waitQueue 等待 release 通知
+ * - 始终返回一个有效 session，不抛出也不返回 null
+ */
+async function acquireOrWait(taskId) {
+  while (true) {
+    if (peakCooldownEnd > Date.now()) {
+      // 高峰冷却期，进入队列等待唤醒
+      await new Promise(resolve => waitQueue.push(resolve));
+      continue;
+    }
+    const session = await sessionManager.acquireSession(taskId);
+    if (session) return session;
+    // 并发满，等待某个 release 后通知
+    console.log(`[acquire-wait] taskId=${taskId} 并发满，等待 session 释放...`);
+    await new Promise(resolve => waitQueue.push(resolve));
+  }
+}
+
+/**
+ * release + 唤醒一个等待者（封装所有 release 调用，确保队列持续流动）
+ */
+async function releaseAndDrain(sessionId, success, taskId) {
+  await sessionManager.releaseSession(sessionId, success, taskId);
+  drainWaitQueue(1);
+}
+
 function createTaskId() {
   return `task_${++taskCounter}_${Date.now()}`;
 }
@@ -163,47 +230,19 @@ async function syncVideoToMainBackend(projectId, episodeId, frameId, videoUrl) {
   if (!projectId || !episodeId || !frameId || !videoUrl) return false;
 
   try {
-    const projectResp = await fetch(`${getMainBackendUrl()}/api/projects/${projectId}`);
-    if (!projectResp.ok) {
-      console.warn(`[sync-video] 获取项目失败 (${projectResp.status})`);
-      return false;
-    }
-
-    const projectJson = await projectResp.json();
-    if (!projectJson?.success || !projectJson?.data) {
-      console.warn('[sync-video] 项目响应无效');
-      return false;
-    }
-
-    const project = projectJson.data;
-    const episode = (project.episodes || []).find(ep => ep.id === episodeId);
-    if (!episode) {
-      console.warn(`[sync-video] 未找到分集: ${episodeId}`);
-      return false;
-    }
-
-    const updatedEpisode = {
-      ...episode,
-      updatedAt: Date.now(),
-      frames: (episode.frames || []).map(frame =>
-        frame.id === frameId
-          ? { ...frame, videoUrl, isGeneratingVideo: false, videoProgress: undefined, videoError: undefined }
-          : frame
-      ),
-    };
-
-    const updateResp = await fetch(`${getMainBackendUrl()}/api/projects/${projectId}/episodes/${episodeId}`, {
-      method: 'PUT',
+    const updateResp = await fetch(`${getMainBackendUrl()}/api/projects/${projectId}/frames/${frameId}/video`, {
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updatedEpisode),
+      body: JSON.stringify({ episodeId, videoUrl }),
     });
 
     if (!updateResp.ok) {
-      console.warn(`[sync-video] 回写分集失败 (${updateResp.status})`);
+      console.warn(`[sync-video] 回写分镜视频失败 (${updateResp.status})`);
       return false;
     }
 
-    console.log(`[sync-video] 已回写分镜视频: ${projectId}/${episodeId}/${frameId}`);
+    const result = await updateResp.json();
+    console.log(`[sync-video] 已回写分镜视频: ${projectId}/${episodeId}/${frameId}, counted=${Boolean(result?.data?.recorded)}`);
     return true;
   } catch (err) {
     console.warn(`[sync-video] 回写异常: ${err.message}`);
@@ -606,6 +645,7 @@ async function persistTasks() {
       startTime: task.startTime,
       historyId: task.historyId || null,
       jimengSessionId: task.jimengSessionId || null,
+      sessionId: task.sessionId || null,
       sessionName: task.sessionName || null,
       projectId: task.projectId || null,
       episodeId: task.episodeId || null,
@@ -652,13 +692,16 @@ async function repairVideoSyncFromLocalFiles() {
 /**
  * 轮询 Jimeng historyId 直到任务完成，返回视频 CDN URL
  * 从 generateSeedanceVideo 中提取，可独立用于崩溃恢复
+ * @param {boolean} isRecovery - 是否为恢复任务（恢复时跳过初始等待）
  */
-async function pollSeedanceHistory(taskId, historyId, sessionId) {
+async function pollSeedanceHistory(taskId, historyId, sessionId, isRecovery = false) {
   const task = tasks.get(taskId);
   if (!task) throw new Error(`任务 ${taskId} 不在内存中`);
 
-  task.progress = '已提交，等待AI生成视频...';
-  await new Promise((r) => setTimeout(r, 10 * 60 * 1000)); // 首次等待 10 分钟
+  task.progress = isRecovery ? '恢复中，正在查询视频状态...' : '已提交，等待AI生成视频...';
+  if (!isRecovery) {
+    await new Promise((r) => setTimeout(r, 10 * 60 * 1000)); // 新任务首次等待 10 分钟
+  }
 
   let status = 20;
   let failCode;
@@ -747,25 +790,33 @@ async function pollSeedanceHistory(taskId, historyId, sessionId) {
 
       const hqItemList = hqResult?.item_list || hqResult?.local_item_list || [];
       const hqItem = hqItemList[0];
+
+      // 扩展URL提取路径，优先提取 vlabvod.com 域名的URL
       const hqUrl =
         hqItem?.video?.transcoded_video?.origin?.video_url ||
+        hqItem?.video?.transcoded_video?.video_url ||
         hqItem?.video?.download_url ||
         hqItem?.video?.play_url ||
         hqItem?.video?.url;
 
       if (hqUrl) {
-        console.log(`[${taskId}] 高清视频URL获取成功`);
+        console.log(`[${taskId}] 高清视频URL获取成功: ${hqUrl.substring(0, 80)}...`);
         return hqUrl;
       }
 
+      // 正则提取：优先匹配 vlabvod.com 域名
       const responseStr = JSON.stringify(hqResult);
       const urlMatch =
+        responseStr.match(/https:\/\/v[0-9]+-[^\"\\]*\.vlabvod\.com\/[^\"\s\\]+/) ||
+        responseStr.match(/https:\/\/v[0-9]+-artist\.vlabvod\.com\/[^\"\s\\]+/) ||
         responseStr.match(/https:\/\/v[0-9]+-dreamnia\.jimeng\.com\/[^\"\s\\]+/) ||
         responseStr.match(/https:\/\/v[0-9]+-[^\"\\]*\.jimeng\.com\/[^\"\s\\]+/);
       if (urlMatch?.[0]) {
-        console.log(`[${taskId}] 正则提取到高清视频URL`);
+        console.log(`[${taskId}] 正则提取到高清视频URL: ${urlMatch[0].substring(0, 80)}...`);
         return urlMatch[0];
       }
+
+      console.log(`[${taskId}] 高清URL响应结构: ${responseStr.substring(0, 500)}...`);
     } catch (err) {
       console.log(`[${taskId}] 获取高清URL失败，使用预览URL: ${err.message}`);
     }
@@ -773,13 +824,35 @@ async function pollSeedanceHistory(taskId, historyId, sessionId) {
 
   const videoUrl =
     itemList?.[0]?.video?.transcoded_video?.origin?.video_url ||
+    itemList?.[0]?.video?.transcoded_video?.video_url ||
     itemList?.[0]?.video?.play_url ||
     itemList?.[0]?.video?.download_url ||
     itemList?.[0]?.video?.url;
 
   if (!videoUrl) throw new Error('未能获取视频URL');
 
-  console.log(`[${taskId}] 视频URL (预览): ${videoUrl}`);
+  // 验证视频有效性：检查文件大小（仅警告，不阻断）
+  try {
+    const headResponse = await fetch(videoUrl, {
+      method: 'HEAD',
+      headers: {
+        'User-Agent': FAKE_HEADERS['User-Agent'],
+        Referer: 'https://jimeng.jianying.com/',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    const contentLength = parseInt(headResponse.headers.get('content-length') || '0');
+    if (contentLength > 0) {
+      console.log(`[${taskId}] 视频URL验证通过 (${(contentLength / 1024 / 1024).toFixed(1)}MB)`);
+    } else {
+      console.warn(`[${taskId}] 无法获取视频大小，但继续使用该URL`);
+    }
+  } catch (validateErr) {
+    console.warn(`[${taskId}] 视频验证失败（继续使用）: ${validateErr.message}`);
+  }
+
+  console.log(`[${taskId}] 最终视频URL: ${videoUrl.substring(0, 100)}...`);
   return videoUrl;
 }
 
@@ -807,6 +880,7 @@ async function loadAndResumeTasks() {
         completedAt: t.completedAt || null,
         historyId: t.historyId || null,
         jimengSessionId: t.jimengSessionId || null,
+        sessionId: t.sessionId || null,
         sessionName: t.sessionName || '已恢复',
         projectId: t.projectId || null,
         episodeId: t.episodeId || null,
@@ -829,13 +903,14 @@ async function loadAndResumeTasks() {
         const capturedId = t.id;
         const capturedHistoryId = t.historyId;
         const capturedSessionId = t.jimengSessionId;
+        const capturedSessionUuid = t.sessionId;
 
         console.log(`[startup] 恢复任务 ${capturedId} (historyId: ${capturedHistoryId})`);
 
         (async () => {
           const task = tasks.get(capturedId);
           try {
-            const videoUrl = await pollSeedanceHistory(capturedId, capturedHistoryId, capturedSessionId);
+            const videoUrl = await pollSeedanceHistory(capturedId, capturedHistoryId, capturedSessionId, true);
             task.progress = '正在保存视频到本地...';
             const localUrl = await downloadAndSaveVideo(videoUrl, `seedance_${capturedId}`);
             const finalUrl = localUrl || videoUrl;
@@ -847,12 +922,14 @@ async function loadAndResumeTasks() {
               data: [{ url: finalUrl, savedLocally: !!localUrl }],
             };
             scheduleTaskCleanup(capturedId);
+            if (capturedSessionUuid) await releaseAndDrain(capturedSessionUuid, true, capturedId);
             console.log(`[startup] 任务 ${capturedId} 恢复成功`);
           } catch (err) {
             task.status = 'error';
             task.completedAt = Date.now();
             task.error = err.message || '恢复任务失败';
             scheduleTaskCleanup(capturedId);
+            if (capturedSessionUuid) await releaseAndDrain(capturedSessionUuid, false, capturedId);
             console.error(`[startup] 任务 ${capturedId} 恢复失败: ${err.message}`);
           }
           await persistTasks();
@@ -1059,6 +1136,7 @@ async function generateSeedanceVideo(taskId, { prompt, ratio, duration, imageBuf
     const retCode = String(generateResult.ret);
     const errMsg = generateResult.errmsg || retCode;
     if (retCode === '5000' || retCode === '1006') throw Object.assign(new Error(`即梦积分不足或没有相关权益 (ret=${retCode})`), { isApiError: true, retCode });
+    if (retCode === '4013') throw Object.assign(new Error(`即梦会员已过期 (ret=4013): ${errMsg}`), { isApiError: true, retCode, isMemberExpired: true });
     throw Object.assign(new Error(`即梦API错误 (ret=${retCode}): ${errMsg}`), { isApiError: true, retCode });
   }
 
@@ -1112,11 +1190,14 @@ async function generateWithAutoRetry(taskId, task, initialSession, genParams, im
         || genErr.message?.includes('高峰期') || genErr.message?.includes('无法提交更多任务');
       const isSecurityCheck = genErr.retCode === '4010'
         || genErr.message?.includes('安全确认');
-      const isRotatable = isInsufficient || isPeakBusy || isSecurityCheck;
+      const isBrowserError = genErr.isBrowserError === true;
+      const isNavError = genErr.isNavError === true; // 页面导航失败（超时/网络）
+      const isMemberExpired = genErr.isMemberExpired === true || genErr.retCode === '4013'; // 会员已过期
+      const isRotatable = isInsufficient || isPeakBusy || isSecurityCheck || isBrowserError || isNavError || isMemberExpired;
 
       if (!isRotatable) {
         // 非可轮换错误：释放当前 session 后抛出，调用方无需再 release
-        await sessionManager.releaseSession(activeSession.id, false, taskId);
+        await releaseAndDrain(activeSession.id, false, taskId);
         if (genErr.message?.includes('auth') || genErr.message?.includes('登录') || genErr.message?.includes('session')) {
           await sessionManager.markSessionStatus(activeSession.id, 'expired');
         }
@@ -1129,10 +1210,16 @@ async function generateWithAutoRetry(taskId, task, initialSession, genParams, im
         ? `积分不足 (ret=${genErr.retCode || '?'})`
         : isSecurityCheck
         ? `安全验证失败 (ret=4010)`
+        : isMemberExpired
+        ? `会员已过期 (ret=4013)`
+        : isNavError
+        ? `页面导航失败（Session ID 可能已过期）: ${genErr.message?.substring(0, 80)}`
+        : isBrowserError
+        ? `浏览器请求异常: ${genErr.message?.substring(0, 100)}`
         : `高峰期限流 (ret=1310)`;
       console.log(`[${taskId}] 账号 "${lastAccountName}" ${reason}，尝试切换账号...`);
 
-      await sessionManager.releaseSession(activeSession.id, false, taskId);
+      await releaseAndDrain(activeSession.id, false, taskId);
       if (isInsufficient) {
         // 积分不足：永久标记，需手动重置
         await sessionManager.markSessionStatus(activeSession.id, 'insufficient');
@@ -1140,47 +1227,65 @@ async function generateWithAutoRetry(taskId, task, initialSession, genParams, im
         // 安全验证失败(4010)：关闭浏览器上下文强制重建指纹，标记 security_check
         await browserService.closeSession(activeSession.sessionId);
         await sessionManager.markSessionStatus(activeSession.id, 'security_check');
+      } else if (isMemberExpired) {
+        // 会员已过期 (ret=4013)：账号会员到期，标记 member_expired
+        await browserService.closeSession(activeSession.sessionId);
+        await sessionManager.markSessionStatus(activeSession.id, 'member_expired');
+        console.log(`[${taskId}] 账号 "${lastAccountName}" 会员已过期 (ret=4013)，已标记为 member_expired`);
+      } else if (isNavError) {
+        // 页面导航失败：Session ID 很可能已过期/失效，标记 expired
+        await browserService.closeSession(activeSession.sessionId);
+        await sessionManager.markSessionStatus(activeSession.id, 'expired');
+        console.log(`[${taskId}] 账号 "${lastAccountName}" 导航失败，已标记为 expired，需要更换 Session ID`);
+      } else if (isBrowserError) {
+        // 浏览器错误：不标记状态，可能是临时网络问题，下次仍可用
+        console.log(`[${taskId}] 浏览器错误，不标记账号状态，将尝试其他账号`);
       }
       // 注：高峰期(1310)不标记 insufficient，账号仍为 active，可接受其他请求
 
-      const nextSession = await sessionManager.acquireSession(taskId);
+      const nextSession = await acquireOrWait(taskId);
       // 检查是否已尝试过该账号（1310 场景下账号仍为 active，可能被重新分配）
-      if (!nextSession || triedSessionIds.has(nextSession.id)) {
-        if (nextSession && triedSessionIds.has(nextSession.id)) {
-          await sessionManager.releaseSession(nextSession.id, false, taskId);
-        }
+      if (triedSessionIds.has(nextSession.id)) {
+        // 已获取的多余 slot 立即归还
+        await releaseAndDrain(nextSession.id, false, taskId);
 
-        // 1310/4010: 等待 10 分钟后重试；积分不足仍立即失败
-        if (!isPeakBusy && !isSecurityCheck) {
+        // 积分不足：立即失败，无需排队等待
+        if (isInsufficient) {
           const finalReason = `即梦所有账号积分不足，最后尝试账号：${lastAccountName}，已无可用账号重试`;
           throw Object.assign(new Error(finalReason), { alreadyReleased: true });
         }
 
-        const waitMinutes = 10;
-        const waitReason = isSecurityCheck ? '安全验证(4010)' : '高峰期限流(1310)';
-        console.log(`[${taskId}] 所有账号 ${waitReason}，等待 ${waitMinutes} 分钟后重试...`);
-        task.progress = `所有账号${waitReason}，等待 ${waitMinutes} 分钟后自动重试...`;
+        // 浏览器错误：所有账号都试过了，可能是网络问题或微服务异常
+        if (isBrowserError) {
+          const finalReason = `所有账号均遇到浏览器请求异常，最后错误: ${genErr.message?.substring(0, 150)}`;
+          throw Object.assign(new Error(finalReason), { alreadyReleased: true });
+        }
+
+        // 导航失败 / 会员过期 / 1310 / 4010：进入等待队列，等待有其他账号可用后重试
+        const waitReason = isNavError
+          ? '页面导航失败（账号已标记过期）'
+          : isMemberExpired
+          ? '会员已过期 (ret=4013，账号已标记过期)'
+          : isSecurityCheck ? '安全验证(4010)' : '高峰期限流(1310)';
+        console.log(`[${taskId}] 所有可用账号已尝试（${waitReason}），进入等待队列...`);
+        task.progress = `${waitReason}，等待其他账号可用后将自动重试...`;
         persistTasks().catch(e => console.warn('[persist] 等待重试持久化失败:', e.message));
 
-        await new Promise(resolve => setTimeout(resolve, waitMinutes * 60 * 1000));
-
-        // 重置已尝试列表，开启新一轮轮换
+        if (!isNavError && !isMemberExpired) {
+          // 仅 1310/4010 触发冷却；导航失败/会员过期不冷却，等待账号释放即可
+          triggerPeakCooldown();
+        }
         triedSessionIds.clear();
 
-        const freshSession = await sessionManager.acquireSession(taskId);
-        if (!freshSession) {
-          throw Object.assign(
-            new Error(`等待 ${waitMinutes} 分钟后仍无可用即梦账号`),
-            { alreadyReleased: true }
-          );
-        }
+        // 阻塞等待：有可用 slot 时由 acquireOrWait 内部唤醒
+        const freshSession = await acquireOrWait(taskId);
         triedSessionIds.add(freshSession.id);
         activeSession = freshSession;
         task.sessionName = freshSession.name;
         task.jimengSessionId = freshSession.sessionId;
         task.progress = `已切换至账号"${freshSession.name}"，继续重试...`;
         persistTasks().catch(e => console.warn('[persist] 等待后切换账号持久化失败:', e.message));
-        console.log(`[${taskId}] 等待后切换至账号 "${freshSession.name}"，继续重试...`);
+        console.log(`[${taskId}] 等待结束，切换至账号 "${freshSession.name}"，继续重试...`);
         continue;
       }
 
@@ -1215,11 +1320,8 @@ app.post('/api/generate-video-from-url', async (req, res) => {
     // 先创建 taskId，再 acquire（以便把 taskId 绑定到并发槽）
     const taskId = createTaskId();
 
-    // 从中心后端获取可用 session
-    const session = await sessionManager.acquireSession(taskId);
-    if (!session) {
-      return res.status(503).json({ error: '没有可用的即梦 Session，请在设置中添加' });
-    }
+    // 从中心后端获取可用 session（并发满时排队等待，不直接失败）
+    const session = await acquireOrWait(taskId);
     const task = {
       id: taskId,
       status: 'processing',
@@ -1288,7 +1390,7 @@ app.post('/api/generate-video-from-url', async (req, res) => {
           data: [{ url: finalUrl, revised_prompt: prompt || '', savedLocally: !!localUrl }],
         };
         scheduleTaskCleanup(taskId);
-        await sessionManager.releaseSession(activeSession.id, true, taskId);
+        await releaseAndDrain(activeSession.id, true, taskId);
         await persistTasks();
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
         console.log(`========== [${taskId}] 视频生成成功 (${elapsed}秒) ==========\n`);
@@ -1300,7 +1402,7 @@ app.post('/api/generate-video-from-url', async (req, res) => {
 
         // alreadyReleased 表示 generateWithAutoRetry 内部已经处理了 release/mark
         if (!err.alreadyReleased) {
-          await sessionManager.releaseSession(session.id, false, taskId);
+          await releaseAndDrain(session.id, false, taskId);
           if (err.retCode === '5000' || err.retCode === '1006' || err.message?.includes('积分不足') || err.message?.includes('没有相关权益')) {
             await sessionManager.markSessionStatus(session.id, 'insufficient');
           } else if (err.retCode === '4010' || err.message?.includes('安全确认')) {
@@ -1325,7 +1427,7 @@ app.post('/api/generate-video-from-url', async (req, res) => {
 });
 
 // POST /api/generate-video - 兼容原始 multipart 模式
-app.post('/api/generate-video', upload.array('files', 5), async (req, res) => {
+app.post('/api/generate-video', upload.array('files', 20), async (req, res) => {
   const startTime = Date.now();
 
   try {
@@ -1334,21 +1436,6 @@ app.post('/api/generate-video', upload.array('files', 5), async (req, res) => {
     const episodeId = req.body.episodeId || null;
     const frameId = req.body.frameId || null;
     const files = req.files;
-
-    // 先创建 taskId，再 acquire（以便把 taskId 绑定到并发槽）
-    const taskId = createTaskId();
-
-    // 获取 session
-    let session;
-    if (reqSessionId) {
-      session = { id: 'manual', sessionId: reqSessionId, name: '手动指定' };
-    } else {
-      session = await sessionManager.acquireSession(taskId);
-    }
-
-    if (!session) {
-      return res.status(503).json({ error: '没有可用的即梦 Session，请在设置中添加' });
-    }
 
     if (!Array.isArray(files) || files.length === 0) {
       return res.status(400).json({ error: 'Seedance 2.0 需要至少上传一张参考图片' });
@@ -1359,25 +1446,27 @@ app.post('/api/generate-video', upload.array('files', 5), async (req, res) => {
       console.log(`[seedance] file[${index}] name=${file.originalname} size=${file.size} type=${file.mimetype}`);
     });
 
+    // 先创建 taskId 并立即返回，让前端可以开始轮询状态
+    const taskId = createTaskId();
+
     const task = {
       id: taskId,
-      status: 'processing',
-      progress: '正在准备...',
+      status: 'waiting',          // 初始状态：等待 session
+      progress: '等待可用账号...',
       startTime,
       result: null,
       error: null,
-      jimengSessionId: session.id !== 'manual' ? session.sessionId : null,
-      sessionName: session.name,
+      jimengSessionId: null,
+      sessionName: null,
       projectId,
       episodeId,
       frameId,
     };
     tasks.set(taskId, task);
 
-    res.json({ taskId, sessionName: session.name });
-
     const imageBuffers = files.map(file => file.buffer);
 
+    // 先分配 session 再响应，确保前端能立即获取 sessionName
     (async () => {
       try {
         const genParams = {
@@ -1386,6 +1475,23 @@ app.post('/api/generate-video', upload.array('files', 5), async (req, res) => {
           duration: parseInt(duration) || 4,
           model: model || 'seedance-2.0',
         };
+
+        let session;
+        if (reqSessionId) {
+          session = { id: 'manual', sessionId: reqSessionId, name: '手动指定' };
+        } else {
+          session = await acquireOrWait(taskId);
+          task.jimengSessionId = session.sessionId;
+          task.sessionId = session.id;
+          task.sessionName = session.name;
+          task.status = 'processing';
+          task.progress = '正在准备...';
+        }
+
+        // 分配完 session 后立即响应前端
+        if (!res.headersSent) {
+          res.json({ taskId, sessionName: session.name });
+        }
 
         let videoUrl;
         let activeSession;
@@ -1414,17 +1520,17 @@ app.post('/api/generate-video', upload.array('files', 5), async (req, res) => {
           data: [{ url: finalUrl, revised_prompt: prompt || '', savedLocally: !!localUrl }],
         };
         scheduleTaskCleanup(taskId);
-        if (activeSession.id !== 'manual') await sessionManager.releaseSession(activeSession.id, true, taskId);
+        if (activeSession.id !== 'manual') await releaseAndDrain(activeSession.id, true, taskId);
         await persistTasks();
       } catch (err) {
         task.status = 'error';
         task.completedAt = Date.now();
         task.error = err.message || '视频生成失败';
         scheduleTaskCleanup(taskId);
-        if (session.id !== 'manual' && !err.alreadyReleased) {
-          await sessionManager.releaseSession(session.id, false, taskId);
+        if (activeSession.id !== 'manual' && !err.alreadyReleased) {
+          await releaseAndDrain(activeSession.id, false, taskId);
           if (err.retCode === '5000' || err.retCode === '1006' || err.message?.includes('积分不足') || err.message?.includes('没有相关权益')) {
-            await sessionManager.markSessionStatus(session.id, 'insufficient');
+            await sessionManager.markSessionStatus(activeSession.id, 'insufficient');
           }
         }
         await persistTasks();
@@ -1456,7 +1562,32 @@ app.get('/api/task/:taskId', (req, res) => {
     return;
   }
 
+  if (task.status === 'waiting') {
+    res.json({ status: 'waiting', elapsed, progress: task.progress, sessionName: task.sessionName });
+    return;
+  }
+
   res.json({ status: 'processing', elapsed, progress: task.progress, sessionName: task.sessionName });
+});
+
+// GET /api/tasks - 获取所有任务列表
+app.get('/api/tasks', (_req, res) => {
+  const taskList = [];
+  for (const [, task] of tasks) {
+    if (task.status === 'processing' || task.status === 'waiting') {
+      taskList.push({
+        id: task.id,
+        status: task.status,
+        projectId: task.projectId,
+        episodeId: task.episodeId,
+        frameId: task.frameId,
+        sessionName: task.sessionName,
+        progress: task.progress,
+        elapsed: Math.floor((Date.now() - task.startTime) / 1000)
+      });
+    }
+  }
+  res.json({ data: taskList });
 });
 
 // ============================================================

@@ -8,11 +8,12 @@ interface LayoutProps {
   title: string;
   onBack?: () => void;
   headerRight?: React.ReactNode;
+  hasTaskBar?: boolean;
 }
 
-export const Layout: React.FC<LayoutProps> = ({ children, activeTab, onTabChange, title, onBack, headerRight }) => {
+export const Layout: React.FC<LayoutProps> = ({ children, activeTab, onTabChange, title, onBack, headerRight, hasTaskBar }) => {
   return (
-    <div className="flex h-screen h-[100dvh] bg-gray-900 text-gray-100">
+    <div className={`flex h-screen h-[100dvh] bg-gray-900 text-gray-100 ${hasTaskBar ? 'pt-14' : ''}`}>
       {/* Sidebar */}
       <aside className="w-20 lg:w-64 bg-gray-950 border-r border-gray-800 flex flex-col transition-all duration-300">
         <div className="p-4 flex items-center justify-center lg:justify-start gap-3 h-16 border-b border-gray-800 cursor-pointer" onClick={onBack}>

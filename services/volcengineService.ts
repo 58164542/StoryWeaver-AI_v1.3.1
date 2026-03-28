@@ -276,6 +276,11 @@ interface VolcengineResponse {
     }>;
     status: string;
   }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
   error?: {
     message: string;
   };
@@ -292,6 +297,11 @@ interface GrsaiChatResponse {
       content?: string;
     };
   }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
 }
 
 export async function checkVolcengineConnectivity(timeoutMs: number = VOLCENGINE_CONNECTIVITY_TIMEOUT_MS): Promise<{ ok: boolean; error?: string }> {
@@ -350,7 +360,7 @@ async function callVolcengineAPI(
   systemInstruction?: string,
   schema?: object,
   schemaName?: string
-): Promise<string> {
+): Promise<{ text: string; usage: any; provider: string; model: string }> {
   const apiKey = process.env.ARK_API_KEY;
 
   // 调试日志：查看实际的 API key 值
@@ -476,7 +486,12 @@ async function callVolcengineAPI(
       console.log("✓ JSON内容无需修复");
     }
 
-    return cleanedContent;
+    return {
+      text: cleanedContent,
+      usage: data.usage || null,
+      provider: 'volcengine',
+      model,
+    };
   } catch (error) {
     console.error("调用火山引擎 API 失败:", error);
     throw error;
@@ -489,7 +504,7 @@ async function callGrsaiChatAPI(
   systemInstruction?: string,
   schema?: object,
   schemaName?: string
-): Promise<string> {
+): Promise<{ text: string; usage: any; provider: string; model: string }> {
   const apiKey = process.env.GRSAI_API_KEY;
 
   if (!apiKey || apiKey === 'PLACEHOLDER_API_KEY') {
@@ -555,7 +570,12 @@ async function callGrsaiChatAPI(
     throw new Error('Grsai API 返回空响应');
   }
 
-  return content;
+  return {
+    text: content,
+    usage: data.usage || null,
+    provider: 'volcengine',
+    model,
+  };
 }
 
 export interface PromptRewriteResult {
@@ -594,7 +614,7 @@ ${policyError ?? ''}
 ${originalPrompt}`;
 
   try {
-    const responseText = await callVolcengineAPI(
+    const responseResult = await callVolcengineAPI(
       model,
       prompt,
       undefined,
@@ -602,7 +622,7 @@ ${originalPrompt}`;
       'prompt_rewrite'
     );
 
-    const result: PromptRewriteResult = JSON.parse(responseText);
+    const result: PromptRewriteResult = JSON.parse(responseResult.text);
     const duration = Date.now() - startTime;
     Logger.logOperationEnd('提示词合规改写（豆包）', { rewrittenLength: result.rewrittenPrompt?.length ?? 0 }, duration);
     return result;
@@ -634,7 +654,7 @@ ${text.substring(0, 30000)}
   `;
 
   try {
-    const responseText = await callVolcengineAPI(
+    const responseResult = await callVolcengineAPI(
       model,
       prompt,
       systemInstruction,
@@ -642,6 +662,7 @@ ${text.substring(0, 30000)}
       "novel_analysis"
     );
 
+    const responseText = responseResult.text;
     console.log("准备解析的JSON文本（前500字符）:", responseText.substring(0, 500));
     console.log("准备解析的JSON文本（后500字符）:", responseText.substring(Math.max(0, responseText.length - 500)));
 
@@ -675,6 +696,9 @@ ${text.substring(0, 30000)}
       throw new Error("返回的 JSON 格式不正确，缺少 characters 或 scenes 字段");
     }
 
+    result.usage = responseResult.usage;
+    result.provider = responseResult.provider;
+    result.model = responseResult.model;
     return result;
   } catch (error) {
     console.error("分析小说文本失败:", error);
@@ -703,7 +727,7 @@ ${text.substring(0, 30000)}
   `;
 
   try {
-    const responseText = await callGrsaiChatAPI(
+    const responseResult = await callGrsaiChatAPI(
       model,
       prompt,
       systemInstruction,
@@ -711,6 +735,7 @@ ${text.substring(0, 30000)}
       "novel_analysis"
     );
 
+    const responseText = responseResult.text;
     console.log("准备解析的JSON文本（前500字符）:", responseText.substring(0, 500));
     console.log("准备解析的JSON文本（后500字符）:", responseText.substring(Math.max(0, responseText.length - 500)));
 
@@ -747,6 +772,9 @@ ${text.substring(0, 30000)}
       throw new Error("返回的 JSON 格式不正确，缺少 characters 或 scenes 字段");
     }
 
+    result.usage = responseResult.usage;
+    result.provider = responseResult.provider;
+    result.model = responseResult.model;
     return result;
   } catch (error) {
     console.error("分析小说文本失败:", error);
@@ -791,7 +819,7 @@ ${text.substring(0, 30000)}
   `;
 
   try {
-    const responseText = await callVolcengineAPI(
+    const responseResult = await callVolcengineAPI(
       model,
       prompt,
       systemInstruction,
@@ -799,6 +827,7 @@ ${text.substring(0, 30000)}
       "storyboard_breakdown"
     );
 
+    const responseText = responseResult.text;
     console.log("准备解析分镜JSON文本（前500字符）:", responseText.substring(0, 500));
 
     let result: StoryboardBreakdown;
@@ -855,6 +884,9 @@ ${text.substring(0, 30000)}
       throw new Error("返回的 JSON 格式不正确，缺少 frames 数组");
     }
 
+    result.usage = responseResult.usage;
+    result.provider = responseResult.provider;
+    result.model = responseResult.model;
     return result;
   } catch (error) {
     console.error("生成分镜分解失败:", error);
@@ -930,7 +962,7 @@ ${text.substring(0, 30000)}
   `;
 
   try {
-    const responseText = await callGrsaiChatAPI(
+    const responseResult = await callGrsaiChatAPI(
       model,
       prompt,
       systemInstruction,
@@ -938,6 +970,7 @@ ${text.substring(0, 30000)}
       "storyboard_breakdown"
     );
 
+    const responseText = responseResult.text;
     console.log("准备解析分镜JSON文本（前500字符）:", responseText.substring(0, 500));
 
     let parsed: unknown;
@@ -971,6 +1004,9 @@ ${text.substring(0, 30000)}
       throw new Error("返回的 JSON 格式不正确，缺少 frames 数组");
     }
 
+    result.usage = responseResult.usage;
+    result.provider = responseResult.provider;
+    result.model = responseResult.model;
     return result;
   } catch (error) {
     console.error("生成分镜分解失败:", error);

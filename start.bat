@@ -56,21 +56,40 @@ for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /c:"IPv4"') do (
 :found_ip
 set "ip=%ip: =%"
 
-:: Start development server
-echo [STARTING] Starting development server...
+:: Check if Seedance service dependencies are installed
+if not exist "server\seedance\node_modules\" (
+    echo [INFO] Installing Seedance service dependencies...
+    cd server\seedance
+    call npm install
+    if errorlevel 1 (
+        echo [ERROR] Seedance dependencies installation failed
+        cd ..\..
+        pause
+        exit /b 1
+    )
+    echo [INFO] Installing Chromium for browser service...
+    call npx playwright-core install chromium
+    cd ..\..
+    echo.
+)
+
+:: Start development servers
+echo [STARTING] Starting services...
 echo.
 echo [Local Access] http://localhost:3000
 if defined ip (
     echo [Network Access] http://%ip%:3000
+    echo [Seedance Service] http://%ip%:3005
     echo.
     echo [INFO] Other devices on the network can access via the network address above
 )
 echo.
 echo ----------------------------------------
-echo Press Ctrl+C to stop the server
+echo Press Ctrl+C to stop all servers
 echo ----------------------------------------
 echo.
 
-npm start
+:: Start both services in one window
+npx concurrently -n "Main,Seedance" -c "cyan,yellow" "npm start" "cd server/seedance && node index.js"
 
 pause

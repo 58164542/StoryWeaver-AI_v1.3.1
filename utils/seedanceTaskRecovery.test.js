@@ -28,6 +28,20 @@ test('App persists seedance waiting and loading state for recovery', async () =>
   assert.match(appSource, /frame\.videoTaskStatus === 'loading' && frame\.seedanceTaskId/, '刷新后应恢复 loading 轮询');
 });
 
+test('App refetches recovered seedance video through atomic frame save path', async () => {
+  const appSource = await readProjectFile('App.tsx');
+
+  assert.match(appSource, /if \(!videoUrl\.startsWith\('\/api\/media\/'\)\) \{[\s\S]*?saveExternalVideo\(/, '重新获取结果时应先转存外部视频');
+  assert.match(appSource, /videoUrl = apiService\.toAbsoluteApiUrl\(videoUrl\)/, '重新获取结果时应标准化视频 URL');
+  assert.match(appSource, /await commitFrameVideoSuccess\(currentProject\.id, currentEpisode\.id, frameId, videoUrl(?:, [^)]*)?\)/, '重新获取结果时应走原子 frame 视频保存接口');
+});
+
+test('App marks refetched seedance task as loading before polling again', async () => {
+  const appSource = await readProjectFile('App.tsx');
+
+  assert.match(appSource, /persistFrameVideoState\(currentProject\.id, currentEpisode\.id, frameId, frame => \(\{[\s\S]*?isGeneratingVideo:\s*true,[\s\S]*?videoTaskStatus:\s*'loading',[\s\S]*?videoError:\s*undefined,[\s\S]*?seedanceTaskUpdatedAt:\s*Date\.now\(\)/, '重新获取结果前应先写入 loading 状态');
+});
+
 test('ret=4010 marks session as security_check, rotates to next account, and refreshes browser context', async () => {
   const [seedanceSource, typesSource, sessionsRouteSource, browserSource] = await Promise.all([
     readProjectFile('server/seedance/index.js'),
@@ -58,9 +72,10 @@ test('ret=1310 and ret=4010 wait and retry instead of terminating', async () => 
 
   // 1310/4010 所有账号用尽时应等待而非直接 throw
   assert.match(seedanceSource, /isPeakBusy\s*\|\|\s*isSecurityCheck/, '1310 和 4010 应共享等待重试逻辑');
-  assert.match(seedanceSource, /等待.*分钟后自动重试/, '应更新 task.progress 为等待状态');
+  assert.match(seedanceSource, /等待其他账号可用后将自动重试/, '应更新 task.progress 为等待状态');
   assert.match(seedanceSource, /triedSessionIds\.clear\(\)/, '等待后应清空 triedSessionIds 重新轮换');
 
   // 积分不足仍应立即失败
-  assert.match(seedanceSource, /!isPeakBusy\s*&&\s*!isSecurityCheck/, '积分不足时应立即 throw 不等待');
+  assert.match(seedanceSource, /isInsufficient/, '应区分积分不足场景');
+  assert.match(seedanceSource, /积分不足：立即失败，无需排队等待/, '积分不足时应立即 throw 不等待');
 });

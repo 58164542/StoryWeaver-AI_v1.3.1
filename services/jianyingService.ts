@@ -74,6 +74,22 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
   });
 };
 
+const getVideoDuration = (blob: Blob): Promise<number> => {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => {
+      window.URL.revokeObjectURL(video.src);
+      resolve(video.duration);
+    };
+    video.onerror = () => {
+      window.URL.revokeObjectURL(video.src);
+      reject(new Error('Failed to load video metadata'));
+    };
+    video.src = window.URL.createObjectURL(blob);
+  });
+};
+
 const generatePlaceholderImageAsBase64 = async (
   width: number,
   height: number,
@@ -548,8 +564,22 @@ export const exportToJianying = async (
       ? rawAudioDur : null;
 
     const rawVideoDur = Number(frame.videoDuration);
-    const videoOriginalDurSec = Number.isFinite(rawVideoDur) && rawVideoDur > 0
+    let videoOriginalDurSec = Number.isFinite(rawVideoDur) && rawVideoDur > 0
       ? rawVideoDur : null;
+
+    // 如果有视频 URL 但没有时长信息，尝试从视频文件读取真实时长
+    if (frame.videoUrl && !videoOriginalDurSec) {
+      try {
+        const videoBlob = await downloadFileAsBlob(frame.videoUrl);
+        const videoDuration = await getVideoDuration(videoBlob);
+        if (videoDuration > 0) {
+          videoOriginalDurSec = videoDuration;
+          Logger.logInfo(`分镜 ${frame.index + 1} 从视频文件读取时长: ${videoDuration}秒`);
+        }
+      } catch (e) {
+        Logger.logInfo(`分镜 ${frame.index + 1} 无法读取视频时长，使用默认值`, { error: String(e) });
+      }
+    }
 
     // 时间轴显示时长：有音频则以音频为准，否则以视频/默认为准
     const targetDurSec = audioDurSec ?? videoOriginalDurSec ?? defaultImgDur;

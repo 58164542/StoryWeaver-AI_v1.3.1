@@ -93,7 +93,7 @@ router.post('/', async (req, res) => {
       totalTasks: 0,
       successCount: 0,
       failCount: 0,
-      maxConcurrent: 10,
+      maxConcurrent: 15,
       createdAt: Date.now(),
     };
 
@@ -139,7 +139,7 @@ router.post('/acquire', async (req, res) => {
     }
 
     const available = sessions
-      .filter(s => s.status === 'active' && (s.currentTasks || 0) < (s.maxConcurrent || 10))
+      .filter(s => s.status === 'active' && (s.currentTasks || 0) < (s.maxConcurrent || 15))
       .sort((a, b) => (a.lastUsed || 0) - (b.lastUsed || 0));
 
     if (available.length === 0) {
@@ -288,11 +288,21 @@ router.put('/:id', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Session 不存在' });
     }
 
+    // 检测 sessionId 是否变更
+    const sessionIdChanged = req.body.sessionId !== undefined && req.body.sessionId !== session.sessionId;
+
     const allowedFields = ['sessionId', 'name', 'status', 'maxConcurrent', 'credits', 'lastUsed', 'totalTasks', 'successCount', 'failCount'];
     for (const key of allowedFields) {
       if (req.body[key] !== undefined) {
         session[key] = req.body[key];
       }
+    }
+
+    // sessionId 变更时自动清理活跃任务，防止槽位泄漏
+    if (sessionIdChanged) {
+      session.activeTasks = [];
+      session.currentTasks = 0;
+      console.log(`[session-update] Session "${session.name}" 的 sessionId 已变更，已清空活跃任务`);
     }
 
     await saveDatabase();

@@ -1,20 +1,18 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import {
-  Project, Episode, ViewMode, ProjectTab, Character, Scene, StoryboardFrame, ProjectType, ProjectSettings, GlobalSettings, ProjectTypeInstruction, StoryboardDialogueLine, CharacterVariant, SeedanceSession
+  Project, Episode, ViewMode, ProjectTab, Character, Scene, StoryboardFrame, ProjectType, ProjectSettings, GlobalSettings, ProjectTypeInstruction, StoryboardDialogueLine, CharacterVariant, SeedanceSession, AnalysisResult
 } from './types';
 import { Layout } from './components/Layout';
 import { analyzeNovelScript as analyzeNovelScriptGemini, generateStoryboardBreakdown as generateStoryboardBreakdownGemini, generateImageAsset, generateVideoFromImage, generateSpeech } from './services/geminiService';
-import { analyzeNovelScript as analyzeNovelScriptVolcengine, analyzeNovelScriptWithGrsai, checkVolcengineConnectivity, generateStoryboardBreakdown as generateStoryboardBreakdownVolcengine, generateStoryboardBreakdownWithGrsai, generateVideoWithVolcengine, rewriteImagePromptForPolicyCompliance } from './services/volcengineService';
+import { analyzeNovelScript as analyzeNovelScriptVolcengine, checkVolcengineConnectivity, generateStoryboardBreakdown as generateStoryboardBreakdownVolcengine, generateVideoWithVolcengine, rewriteImagePromptForPolicyCompliance } from './services/volcengineService';
 import { generateVideoWithSeedance, generateVideoWithSeedanceMultiRef } from './services/seedanceService';
 import { generateVideoWithSora } from './services/soraService';
 import { generateVideoWithKlingOmni } from './services/klingService';
-import { pollJimengSeedanceTask, submitJimengSeedanceImageToVideoTask, submitJimengSeedanceMultiRefTask } from './services/jimengSeedanceService';
+import { pollJimengSeedanceTask, submitJimengSeedanceImageToVideoTask, submitJimengSeedanceMultiRefTask, getActiveTasks, ActiveTask } from './services/jimengSeedanceService';
 import { generateVideoWithBltcySora, generateVideoWithBltcyVeo3, generateVideoWithBltcyWan26, generateVideoWithBltcyGrokVideo3 } from './services/bltcySoraService';
 import { generateImageWithBananaPro } from './services/bananaProService';
 import { generateImageWithVolcengine } from './services/volcengineImageService';
-import { generateImageWithXskillNanoBanana2 } from './services/xskillImageService';
-import { generateImageWithJarvisNanoBanana2 } from './services/jarvisImageService';
 import { generateImageWithBltcyBanana2 } from './services/bltcyOneApiImageService';
 import { generateImageWithBltcyNanoBananaHd, generateImageWithBltcyNanoBananaPro } from './services/bltcyNanoBananaHdImageService';
 import { exportToJianying } from './services/jianyingService';
@@ -25,6 +23,8 @@ import { analyzeNovelScriptWithClaude, generateStoryboardBreakdownWithClaude, se
 import { createDuplicatedProject } from './utils/projectDuplication.js';
 import { PREPROCESS_SEGMENT_CONCURRENCY, mapWithConcurrencyLimit } from './utils/segmentConcurrency.js';
 import { buildEpisodeFromPreprocessResult, getFailedPreprocessEpisodes } from './utils/preprocessSegmentation.js';
+import { buildProjectStatsSummary } from './utils/projectStatsView.js';
+import { buildProjectTextUsagePayload } from './utils/projectTextUsage.js';
 import { generateFrameAudioWithMinimax } from './services/ttsService';
 import { Loader2, Plus, Trash2, Save, Wand2, Image as ImageIcon, Play, Pause, SkipBack, SkipForward, Download, Users, Film, ArrowLeft, FileText, Clock, Settings, X, Link, Edit2, Check, LayoutGrid, Clapperboard, ChevronRight, ChevronLeft, Globe, Copy, CheckSquare, Square, GripVertical, MoreHorizontal, Volume2, Mic, AlertCircle, RefreshCw, Eye, Upload, Search } from 'lucide-react';
 import * as apiService from './services/apiService';
@@ -46,8 +46,123 @@ const DEFAULT_PROJECT_PROMPTS = {
     sceneExtraction: '请分析文本，提取主要场景。关注环境描写、氛围和光影。',
 };
 
+const DEFAULT_PREPROCESS_SEGMENT_PROMPT = `# 角色与任务
+你是一位专业的AI视频分镜师与提示词工程师。你的任务是根据输入的【小说章节文案】，结合【故事情节】与【角色信息】，生成高质量、逻辑严密且符合物理规律的**分镜描述（Prompt）**与**视频生成提示词（Video Prompt）**。每1000字小说文案默认输出至少15个以上分镜；但若触发了【第4条·镜头精简与合并原则】，允许密度降至15个以下（不低于10个/1000字）。不要生成旁白内容，保留人物角色的内心OS（OS需要使用第一人称）。
+
+# 输入信息
+
+**故事情节：**
+{{故事情节}}
+
+**角色信息：**
+{{角色信息}}
+
+**场景信息：**
+{{场景信息}}
+
+**小说原文：**
+{{小说原文}}
+
+**推文文案：**
+{{推文文案}}
+
+**章节文案前分镜信息：**
+{{前面分镜:2}}
+
+**章节文案后分镜信息：**
+{{后面分镜:2}}
+
+**章节文案：**
+{{章节文案}}
+
+
+# 核心执行逻辑与原则
+
+### 1. 零容忍原则（必须严格遵守）
+* **对话原文锁定**：如果章节文案中包含对话，**必须100%逐字引用原文**，严禁修改一个字，严禁增加原文没有的对话。
+* **违禁词清洗**：输出结果中严禁出现血腥、暴力、色情、低俗及政治敏感词汇。
+* *处理方式*：检测到违禁概念时，自动替换为符合剧情逻辑的中性描述（例："嘴角流血"→"紧咬下唇，面色苍白"；"砍头"→"重击倒地"）。
+* **格式标点**：所有输出内容的对话部分，必须使用中文双引号 \`""\`，**严禁**使用英文双引号 \`""\`。
+* **场景信息**：给出的场景信息，必须对应，然后一字不改的放到我需要的位置。
+
+
+### 2. 连贯性与物理逻辑（六维一致性）
+* **状态继承**：当前分镜的起始状态（人物姿势、物品位置、伤痕状态）必须完美承接上一分镜的结束状态。
+* **时空统一**：相邻分镜的光影（晨/午/晚）、天气、背景细节必须保持一致，除非有明确的时间跳跃描述。
+* **口型同步**：
+* 有台词时：角色必须有"张嘴说话、嘴唇闭合"的描述，且镜头必须保持稳定（不推拉）。
+* 无台词时：严禁出现张嘴说话的动作描述。
+* *内心OS*：角色嘴巴不动，仅通过表情或画外音表现。
+
+### 3. 分镜增加原则与台词时长适配规则
+
+#### A. 自动增加镜头
+当出现以下任一情况时，必须自动增加分镜数量，禁止强行压缩到同一镜头：
+1. **场景切换**：地点变化、时间变化、白天/夜晚切换。
+2. **角色切换**：说话人变化、主视角变化、新角色登场。
+3. **动作切换**：站起、转身、奔跑、跌倒、递东西、开门等关键动作。
+4. **情绪切换**：平静→震惊、隐忍→爆发、冷笑→落泪等。
+5. **信息重点**：出现关键道具、证据、手机画面、热搜、合同、诊断书等必须单独给镜头。
+6. **对话过长**：同一段台词超过口播舒适时长，必须拆镜。
+
+#### B. 台词时长硬约束（必须遵守）
+* 单个分镜内若含明显可说出的完整台词，台词长度必须与镜头时长匹配。
+* **默认规则**：
+  * 0-3秒：适合短句（约 10-18 字）
+  * 4-8秒：适合中短句（约 18-35 字）
+  * 9-15秒：适合完整表达（约 35-60 字）
+* 如果原文台词明显超过当前镜头可承载时长，**必须拆分为两个或多个连续分镜**，严禁把超长对白硬塞进 3-5 秒镜头。
+* 拆分长对白时，必须保持：
+  * 说话人连续一致
+  * 情绪递进一致
+  * 镜头角度可变化，但语义必须完整衔接
+
+### 4. 镜头精简与合并原则（用于避免无意义碎镜）
+满足以下条件时，允许合并镜头，以提升节奏流畅性：
+1. 同一角色在同一地点连续进行弱变化动作（如“抬眼→沉默→攥紧手”）。
+2. 同一情绪持续推进，且没有新信息点出现。
+3. 没有新增对话、没有新增道具、没有新增角色关系变化。
+
+**但注意：**
+* 只要出现【动作切换 / 视角切换 / 关键信息点 / 长对白超时】，就不能合并。
+* 精简镜头的目标是“去掉重复信息”，不是“压缩叙事密度”。
+
+### 5. Prompt 生成要求（画面提示词）
+每个分镜必须先输出一个用于生成首帧图/分镜图的 **Prompt**，要求：
+* 必须包含：**场景 + 镜头景别 + 主体角色 + 动作状态 + 情绪氛围 + 光影/时间信息**。
+* 必须明确人物身份，不可只写“男人/女人/女生/男生”，要写角色名。
+* 服装、姿势、视线方向必须与上下文连续。
+* Prompt 要适合直接用于图像生成，避免抽象空话。
+
+### 6. Video Prompt 生成要求（视频提示词）
+每个分镜必须输出与 Prompt 对应的 **Video Prompt**，要求：
+* 必须描述：镜头运动、人物动作、表情变化、环境动态。
+* 必须符合物理逻辑，动作不能跳变。
+* 如果该镜头有对白：镜头尽量稳，强调口型与表情。
+* 如果该镜头无对白：可增加适度运镜与氛围动作。
+* 禁止写成抽象风格词堆砌，必须是可执行的镜头描述。
+
+### 7. 输出格式要求（必须严格一致）
+每个分镜必须按如下格式输出，不得增加解释：
+
+1_【Prompt】
+::~FIELD::~_[这里填写首帧图 Prompt]_::~FIELD::~_
+【VideoPrompt】
+场景：[场景信息原文粘贴]
+衔接前置指令：[与上一镜的状态衔接]
+【0-3秒】镜头：[动作/表情/运镜]；音效：[可选]
+【4-8秒】镜头：[动作/表情/运镜]；音效：[可选]
+【9-15秒】镜头：[动作/表情/运镜]；音效：[可选]
+_::~RECORD::~_
+
+---
+
+# 开始执行
+请严格按照以上格式与逻辑，解析输入的章节文案并生成结果。`;
+
 const DEFAULT_GLOBAL_SETTINGS: GlobalSettings = {
   extractionModel: 'doubao-seed-2-0-pro-260215',
+  preprocessModel: 'claude-sonnet-4-6',
   jianyingExportPathFull: '',
   projectTypeLabels: {
     'REAL_PERSON_COMMENTARY': '真人解说漫',
@@ -286,6 +401,7 @@ _::~RECORD::~_
         characterExtraction: '提取适合2D动画的角色特征，输出字段：name（禁止括号注释）、aliases（脚本中出现的别名别称）、description、role、appearance（完整基础形象：线条特征、发型、体型比例+日常常服/默认服装）、personality。同时提取角色外貌变体（variants）：【变体识别规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体"格式），常服/日常装束归入主体 appearance 而非变体；每个变体输出 characterName、name（变体名）、context（出现场景）、appearance（变体专属外貌含服装视觉风格）。',
         sceneExtraction: '提取适合2D背景的场景描述，关注色彩搭配和构图。',
         storyboardBreakdown: '将文本拆解为2D动画分镜。强调动画的节奏感和表现力，注重角色的夸张表情和动作设计。每个分镜应描述关键帧动作、表情变化和画面构图，适合2D动画制作流程。',
+        preprocessSegmentPrompt: DEFAULT_PREPROCESS_SEGMENT_PROMPT,
         preprocessSecondPassPrompt: ''
     },
     'COMMENTARY_3D': {
@@ -297,6 +413,7 @@ _::~RECORD::~_
         characterExtraction: '提取适合3D建模的角色特征，输出字段：name（禁止括号注释）、aliases（脚本中出现的别名别称）、description、role、appearance（完整基础形象：面部结构、发型、身形比例+日常常服/默认服装）、personality。同时提取角色外貌变体（variants）：【变体识别规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体"格式），常服/日常装束归入主体 appearance 而非变体；每个变体输出 characterName、name（变体名）、context（出现场景）、appearance（变体专属外貌含服装3D材质）。',
         sceneExtraction: '提取3D场景描述，关注空间结构和环境光遮蔽。',
         storyboardBreakdown: '将文本拆解为3D动画分镜。注重三维空间的镜头运动和角色在空间中的位置关系。每个分镜应包含虚拟摄像机参数（焦距、景深）、角色动画时长和场景光照设置，适合3D动画制作。',
+        preprocessSegmentPrompt: DEFAULT_PREPROCESS_SEGMENT_PROMPT,
         preprocessSecondPassPrompt: ''
     },
     'PREMIUM_2D': {
@@ -308,6 +425,7 @@ _::~RECORD::~_
         characterExtraction: '提取极具美感的角色设计，输出字段：name（禁止括号注释）、aliases（脚本中出现的别名别称）、description、role、appearance（完整基础形象：唯美风格的面部、发型、整体气质+日常常服/默认服装）、personality。同时提取角色外貌变体（variants）：【变体识别规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体"格式），常服/日常装束归入主体 appearance 而非变体；每个变体输出 characterName、name（变体名）、context（出现场景）、appearance（变体专属外貌含服装艺术风格）。',
         sceneExtraction: '提取宏大的场景描述，关注天气、动态元素和艺术氛围。',
         storyboardBreakdown: '将文本拆解为高品质2D动画分镜。追求电影级的视觉美学，注重光影氛围、色彩情绪和细腻的画面细节。每个分镜应描述唯美的构图、动态的自然元素（云、光、粒子）和角色的微妙情感表达，适合高预算动画电影制作。',
+        preprocessSegmentPrompt: DEFAULT_PREPROCESS_SEGMENT_PROMPT,
         preprocessSecondPassPrompt: ''
     },
     'PREMIUM_3D': {
@@ -319,6 +437,7 @@ _::~RECORD::~_
         characterExtraction: '提取复杂的角色设计，输出字段：name（禁止括号注释）、aliases（脚本中出现的别名别称）、description、role、appearance（完整基础形象：史诗级面部特征、发型、体格+日常常服/默认服装）、personality。同时提取角色外貌变体（variants）：【变体识别规则】仅提取文本中明确标注了"变体XX"编号的条目（如"变体01""变体02""#### 变体"格式），常服/日常装束归入主体 appearance 而非变体；每个变体输出 characterName、name（变体名）、context（出现场景）、appearance（变体专属外貌含盔甲/服装好莱坞级别描述）。',
         sceneExtraction: '提取史诗级场景，关注巨大的建筑结构和复杂的气候系统。',
         storyboardBreakdown: '将文本拆解为好莱坞级别的3D分镜。追求史诗级的视觉冲击力，注重宏大的场景规模、复杂的镜头运动和震撼的特效设计。每个分镜应包含电影级的镜头语言、动态的环境效果（爆炸、天气、粒子）和角色的史诗动作，适合AAA级游戏或大片制作。',
+        preprocessSegmentPrompt: DEFAULT_PREPROCESS_SEGMENT_PROMPT,
         preprocessSecondPassPrompt: ''
     }
   }
@@ -369,6 +488,7 @@ const normalizeProject = (project: Project): Project => ({
     ...(project.settings ?? {}),
     imageModel: migrateImageModel(project.settings?.imageModel)
   },
+  episodeRecycleBin: project.episodeRecycleBin ?? [],
   episodes: (project.episodes ?? []).map(episode => ({
     ...episode,
     isProcessing: false,
@@ -622,9 +742,7 @@ const buildVariantAssetPrompt = (prefix: string, variant: CharacterVariant): str
 };
 
 const isVolcengineImageModel = (model: string) => model.startsWith('doubao-seedream');
-const isBananaProImageModel = (model: string) => model === 'nano-banana-pro' || model === 'nano-banana-pro-vt' || model === 'nano-banana-2';
-const isXskillNanoBanana2Model = (model: string) => model === 'xskill-nano-banana-2';
-const isJarvisNanoBanana2Model = (model: string) => model === 'jarvis-nano-banana-2';
+const isBananaProImageModel = (model: string) => model === 'nano-banana-pro' || model === 'nano-banana-pro-vt';
 const isBltcyBanana2Model = (model: string) => model === 'bltcy-banana-2';
 const isBltcyNanoBananaHdModel = (model: string) => model === 'bltcy-nano-banana-hd';
 const isBltcyNanoBananaProModel = (model: string) => model === 'bltcy-nano-banana-pro';
@@ -641,12 +759,6 @@ const generateAssetImageWithSelectedModel = async (
   if (isVolcengineImageModel(model)) {
     return generateImageWithVolcengine(prompt, '16:9', [], '2K', onProgress, model);
   }
-  if (isXskillNanoBanana2Model(model)) {
-    return generateImageWithXskillNanoBanana2(prompt, '16:9', [], projectId, onProgress);
-  }
-  if (isJarvisNanoBanana2Model(model)) {
-    return generateImageWithJarvisNanoBanana2(prompt, '16:9', [], projectId, onProgress);
-  }
   if (isBltcyBanana2Model(model)) {
     return generateImageWithBltcyBanana2(prompt, '16:9', [], projectId, onProgress);
   }
@@ -660,8 +772,6 @@ const generateAssetImageWithSelectedModel = async (
 };
 
 const isClaudeChatModel = (model: string) => model.startsWith('claude-');
-const isGrsaiChatModel = (model: string) => model.startsWith('grsai-');
-const getGrsaiChatModelName = (model: string) => model.replace(/^grsai-/, '');
 
 const splitDialogueStringToDialogues = (dialogue?: string): StoryboardDialogueLine[] | undefined => {
   const input = (dialogue ?? '').trim();
@@ -1119,9 +1229,8 @@ const FrameEditorModal: React.FC<FrameEditorModalProps> = ({ frame, project, onS
                         </div>
                         <div className="flex-1 min-w-0">
                           <span className={`text-xs truncate block ${isSelected ? 'text-purple-200' : 'text-gray-400'}`}>
-                            {variant.name}
+                            {parentChar ? `${parentChar.name}-${variant.name}` : variant.name}
                           </span>
-                          {parentChar && <span className="text-[10px] text-gray-600">{parentChar.name}</span>}
                         </div>
                         {isSelected && <Check size={14} className="text-purple-400 shrink-0" />}
                       </button>
@@ -1368,9 +1477,6 @@ const ProjectSettingsForm: React.FC<{
             className="w-full bg-gray-700 border border-gray-600 rounded p-2 text-white"
           >
             <option value="nano-banana-pro-vt">grsai中转_香蕉pro (推荐)</option>
-            <option value="nano-banana-2">grsai中转_nano-banana-2</option>
-            <option value="xskill-nano-banana-2">速推nano banana2</option>
-            <option value="jarvis-nano-banana-2">贾维斯中转nano banana2</option>
             <option value="bltcy-banana-2">柏拉图中转_banana2 (2K)</option>
             <option value="bltcy-nano-banana-hd">柏拉图中转_nano banana (HD)</option>
             <option value="bltcy-nano-banana-pro">柏拉图中转_nano banana pro</option>
@@ -1389,9 +1495,6 @@ const ProjectSettingsForm: React.FC<{
             className="w-full bg-gray-700 border border-gray-600 rounded p-2 text-white"
           >
             <option value="nano-banana-pro-vt">grsai中转_香蕉pro (推荐)</option>
-            <option value="nano-banana-2">grsai中转_nano-banana-2</option>
-            <option value="xskill-nano-banana-2">速推nano banana2</option>
-            <option value="jarvis-nano-banana-2">贾维斯中转nano banana2</option>
             <option value="bltcy-banana-2">柏拉图中转_banana2 (2K)</option>
             <option value="bltcy-nano-banana-hd">柏拉图中转_nano banana (HD)</option>
             <option value="bltcy-nano-banana-pro">柏拉图中转_nano banana pro</option>
@@ -1614,21 +1717,15 @@ const GlobalSettingsModal: React.FC<{
     }
   };
 
-  const handleQuerySeedanceCredits = async (id: string) => {
-    try {
-      setSeedanceLoading(true);
-      await apiService.querySeedanceSessionCredits(id);
-      await refreshSeedanceSessions();
-    } catch (error) {
-      alert('查询积分失败：' + (error as Error).message);
-    } finally {
-      setSeedanceLoading(false);
-    }
-  };
-
-  const handleStartEditSeedanceSessionId = (session: SeedanceSession) => {
+  const handleStartEditSeedanceSessionId = async (session: SeedanceSession) => {
     setEditingSeedanceSessionId(session.id);
-    setEditingSeedanceSessionValue('');
+    setEditingSeedanceSessionValue('加载中...');
+    try {
+      const fullSessionId = await apiService.getSeedanceSessionFullById(session.id);
+      setEditingSeedanceSessionValue(fullSessionId ?? '');
+    } catch {
+      setEditingSeedanceSessionValue('');
+    }
   };
 
   const handleSaveSeedanceSessionId = async (session: SeedanceSession) => {
@@ -1639,9 +1736,16 @@ const GlobalSettingsModal: React.FC<{
 
     try {
       setSeedanceLoading(true);
-      await apiService.updateSeedanceSession(session.id, {
+      const updateData: any = {
         sessionId: editingSeedanceSessionValue.trim()
-      });
+      };
+
+      // 如果当前是过期状态，保存新 ID 时自动恢复为 active
+      if (session.status === 'expired' || session.status === 'member_expired') {
+        updateData.status = 'active';
+      }
+
+      await apiService.updateSeedanceSession(session.id, updateData);
       await apiService.syncSeedanceSessions();
       await refreshSeedanceSessions();
       setEditingSeedanceSessionId(null);
@@ -1660,7 +1764,8 @@ const GlobalSettingsModal: React.FC<{
 
   const getSeedanceStatusLabel = (status: SeedanceSession['status']) => {
     if (status === 'active') return '可用';
-    if (status === 'expired') return '过期';
+    if (status === 'expired') return 'Session过期';
+    if (status === 'member_expired') return '会员过期';
     if (status === 'insufficient') return '积分不足';
     if (status === 'security_check') return '需安全验证';
     return '禁用';
@@ -1669,6 +1774,7 @@ const GlobalSettingsModal: React.FC<{
   const getSeedanceStatusClass = (status: SeedanceSession['status']) => {
     if (status === 'active') return 'bg-green-500/15 text-green-300 border-green-500/30';
     if (status === 'expired') return 'bg-red-500/15 text-red-300 border-red-500/30';
+    if (status === 'member_expired') return 'bg-purple-500/15 text-purple-300 border-purple-500/30';
     if (status === 'insufficient') return 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30';
     if (status === 'security_check') return 'bg-orange-500/15 text-orange-300 border-orange-500/30';
     return 'bg-gray-500/15 text-gray-300 border-gray-500/30';
@@ -1790,10 +1896,29 @@ const GlobalSettingsModal: React.FC<{
             >
               <option value="doubao-seed-2-0-pro-260215">豆包 Seed 2.0 Pro (推荐 - 火山引擎)</option>
               <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (Univibe 中转)</option>
-              <option value="grsai-gemini-3.1-pro">Grsai 中转 Gemini 3.1 Pro</option>
               <option value="gemini-3-flash-preview">Gemini 3 Flash (快速)</option>
               <option value="gemini-3-pro-preview">Gemini 3 Pro (高推理 - 较慢)</option>
               <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+            </select>
+          </section>
+
+          <div className="w-full h-px bg-gray-700"></div>
+
+          {/* Preprocess Model Selection */}
+          <section>
+            <h3 className="text-md font-bold text-white mb-3">预处理模型</h3>
+            <p className="text-sm text-gray-400 mb-3">用于资产提取、角色提取、场景提取的Claude模型。</p>
+            <select
+              value={localSettings.preprocessModel || 'claude-sonnet-4-6'}
+              onChange={(e) => {
+                const nextSettings = { ...localSettings, preprocessModel: e.target.value };
+                setLocalSettings(nextSettings);
+              }}
+              className="w-full bg-gray-900 border border-gray-600 rounded p-3 text-white focus:border-green-500 focus:outline-none"
+            >
+              <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+              <option value="claude-opus-4-6">Claude Opus 4.6</option>
+              <option value="claude-opus-4-6-thinking">Claude Opus 4.6 Thinking</option>
             </select>
           </section>
 
@@ -1965,7 +2090,7 @@ const GlobalSettingsModal: React.FC<{
                             value={editingSeedanceSessionValue}
                             onChange={(e) => setEditingSeedanceSessionValue(e.target.value)}
                             className="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-white text-sm focus:border-green-500 focus:outline-none"
-                            placeholder="输入新的 Session ID"
+                            placeholder="输入新的 Session ID（留空则不修改）"
                           />
                           <div className="flex gap-2">
                             <button
@@ -1992,12 +2117,6 @@ const GlobalSettingsModal: React.FC<{
                       </div>
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      <button
-                        onClick={() => handleQuerySeedanceCredits(session.id)}
-                        className="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-500 text-white text-xs"
-                      >
-                        查询积分
-                      </button>
                       <button
                         onClick={() => handleStartEditSeedanceSessionId(session)}
                         className="px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs"
@@ -2365,6 +2484,7 @@ const App: React.FC = () => {
   const savedGlobalSettingsRef = useRef<string | null>(null);
   const seedanceRecoveryStartedRef = useRef(false);
   const seedancePollingFramesRef = useRef<Set<string>>(new Set());
+  const [activeTasks, setActiveTasks] = useState<ActiveTask[]>([]);
 
   const persistFrameVideoState = useCallback((
     projectId: string,
@@ -2393,6 +2513,44 @@ const App: React.FC = () => {
     }));
   }, []);
 
+  const commitFrameVideoSuccess = useCallback(async (
+    projectId: string,
+    episodeId: string,
+    frameId: string,
+    videoUrl: string,
+    videoDuration?: number
+  ) => {
+    const response = await apiService.updateFrameVideo(projectId, episodeId, frameId, { videoUrl, videoDuration });
+    const nextStats = response?.data?.stats;
+
+    setProjects(prev => prev.map(p => {
+      if (p.id !== projectId) return p;
+      return {
+        ...p,
+        updatedAt: Date.now(),
+        stats: nextStats ?? p.stats,
+        episodes: p.episodes.map(e => {
+          if (e.id !== episodeId) return e;
+          return {
+            ...e,
+            updatedAt: Date.now(),
+            frames: e.frames.map(f => f.id === frameId ? {
+              ...f,
+              videoUrl,
+              videoDuration: videoDuration ?? f.videoDuration,
+              isGeneratingVideo: false,
+              videoTaskStatus: undefined,
+              videoQueuePosition: undefined,
+              videoProgress: undefined,
+              videoError: undefined,
+              seedanceTaskUpdatedAt: Date.now(),
+            } : f),
+          };
+        }),
+      };
+    }));
+  }, []);
+
   const startSeedanceTaskPolling = useCallback(async (
     projectId: string,
     episodeId: string,
@@ -2415,7 +2573,7 @@ const App: React.FC = () => {
     }));
 
     try {
-      let videoUrl = await pollJimengSeedanceTask(taskId, (progress) => {
+      let videoUrl = await pollJimengSeedanceTask(taskId, (progress, sessionName) => {
         setProjects(prev => prev.map(p => p.id !== projectId ? p : {
           ...p,
           episodes: p.episodes.map(e => e.id !== episodeId ? e : {
@@ -2426,6 +2584,7 @@ const App: React.FC = () => {
               videoTaskStatus: 'loading',
               videoQueuePosition: undefined,
               videoProgress: progress,
+              videoSessionName: sessionName,
             } : f)
           })
         }));
@@ -2438,21 +2597,10 @@ const App: React.FC = () => {
       videoUrl = apiService.toAbsoluteApiUrl(videoUrl);
       console.log(`[视频生成完成] frameId=${frameId}, videoUrl=${videoUrl}`);
 
-      persistFrameVideoState(projectId, episodeId, frameId, frame => ({
-        ...frame,
-        videoUrl,
-        videoDuration,
-        isGeneratingVideo: false,
-        videoTaskStatus: undefined,
-        videoQueuePosition: undefined,
-        videoProgress: undefined,
-        videoError: undefined,
-        seedanceTaskId: undefined,
-        seedanceTaskUpdatedAt: Date.now(),
-      }));
+      await commitFrameVideoSuccess(projectId, episodeId, frameId, videoUrl, videoDuration);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      Logger.logError('App', '生成视频失败', errorMessage);
+      Logger.logError('App', '生成视频失败', { taskId, frameId, error: errorMessage });
       persistFrameVideoState(projectId, episodeId, frameId, frame => ({
         ...frame,
         isGeneratingVideo: false,
@@ -2562,12 +2710,17 @@ const App: React.FC = () => {
     const capturedImageUrl = frame.imageUrl ?? '';
     const multiRefModel = globalSettings.multiRefVideoModel || 'seedance_2.0_fast';
 
-    const onProgress = (progress: number) => {
+    const onProgress = (progress: number, sessionName?: string) => {
       setProjects(prev => prev.map(p => p.id !== projectId ? p : {
         ...p,
         episodes: p.episodes.map(e => e.id !== episodeId ? e : {
           ...e,
-          frames: e.frames.map(f => f.id === frameId ? { ...f, videoProgress: progress } : f)
+          frames: e.frames.map(f => f.id === frameId ? {
+            ...f,
+            videoProgress: progress,
+            videoSessionName: sessionName,
+            videoTaskStatus: progress <= 1 ? 'waiting' : 'loading'
+          } : f)
         })
       }));
     };
@@ -2668,18 +2821,7 @@ const App: React.FC = () => {
         videoUrl = apiService.toAbsoluteApiUrl(videoUrl);
         console.log(`[视频生成完成] frameId=${frameId}, videoUrl=${videoUrl}`);
 
-        persistFrameVideoState(projectId, episodeId, frameId, currentFrame => ({
-          ...currentFrame,
-          videoUrl,
-          videoDuration,
-          isGeneratingVideo: false,
-          videoTaskStatus: undefined,
-          videoQueuePosition: undefined,
-          videoProgress: undefined,
-          videoError: undefined,
-          seedanceTaskId: undefined,
-          seedanceTaskUpdatedAt: Date.now(),
-        }));
+        await commitFrameVideoSuccess(projectId, episodeId, frameId, videoUrl, videoDuration);
       },
       onError: (error: string) => {
         Logger.logError('App', '生成视频失败', error);
@@ -2738,6 +2880,9 @@ const App: React.FC = () => {
   const [showRecycleBinModal, setShowRecycleBinModal] = useState(false);
   const [recycleBinProjects, setRecycleBinProjects] = useState<Array<Project & { deletedAt?: number }>>([]);
   const [isRecycleBinLoading, setIsRecycleBinLoading] = useState(false);
+  const [showEpisodeRecycleBinModal, setShowEpisodeRecycleBinModal] = useState(false);
+  const [episodeRecycleBin, setEpisodeRecycleBin] = useState<Array<Episode & { deletedAt: number }>>([]);
+  const [isEpisodeRecycleBinLoading, setIsEpisodeRecycleBinLoading] = useState(false);
   const [isOpeningProject, setIsOpeningProject] = useState(false);
   const [openingProjectId, setOpeningProjectId] = useState<string | null>(null);
   const [editingFrameId, setEditingFrameId] = useState<string | null>(null); // For FrameEditorModal
@@ -2747,16 +2892,57 @@ const App: React.FC = () => {
   const [previewFrameMode, setPreviewFrameMode] = useState<'image' | 'video'>('image');
   const [previewAsset, setPreviewAsset] = useState<{ type: 'character' | 'scene'; id: string } | null>(null);
 
+  type PreprocessTaskStage = 'connectivity' | 'asset_extraction' | 'segmenting' | 'second_pass' | 'completed' | 'failed' | 'interrupted';
+  type PreprocessTaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'interrupted';
+  type PreprocessTaskState = {
+    id: string;
+    type: 'novel' | 'episode';
+    projectId: string;
+    episodeId?: string;
+    episodeName?: string;
+    status: PreprocessTaskStatus;
+    stage: PreprocessTaskStage;
+    error?: string;
+    resultAppliedAt?: number;
+    input?: {
+      episodeDrafts?: Array<{ title: string; content: string }>;
+      episodeId?: string;
+      episodeName?: string;
+      originalContent?: string;
+    };
+    progress: {
+      total: number;
+      completed: number;
+      currentEpisodeName?: string;
+      assetExtractionDone?: boolean;
+      secondPassCompleted?: number;
+    };
+    results: {
+      analysis?: AnalysisResult;
+      segmentedScripts?: Array<SegmentEpisodeResult | null>;
+      finalScripts?: Array<SegmentEpisodeResult | null>;
+      secondPassFailedIndexes?: number[];
+      episodeResult?: { content: string; failed: boolean; secondPassFailed?: boolean };
+      availableProviders?: Array<'univibe' | 'bltcy' | 'cc580'>;
+    };
+  };
+
   // 小说预处理 Modal
   const [showNovelPreprocessModal, setShowNovelPreprocessModal] = useState(false);
   const [preprocessNovelText, setPreprocessNovelText] = useState('');
   const [isPreprocessing, setIsPreprocessing] = useState(false);
   const [enableSecondPass, setEnableSecondPass] = useState(false);
+  const [enableAutoStoryboard, setEnableAutoStoryboard] = useState(false);
+  const [storyboardProgress, setStoryboardProgress] = useState<{ current: number; total: number; currentName: string } | null>(null);
   const [showEpisodePreprocessModal, setShowEpisodePreprocessModal] = useState(false);
   const [isEpisodePreprocessing, setIsEpisodePreprocessing] = useState(false);
   const [enableEpisodeSecondPass, setEnableEpisodeSecondPass] = useState(false);
   const [episodePreprocessResult, setEpisodePreprocessResult] = useState<string | null>(null);
   const [showEpisodePreprocessPreview, setShowEpisodePreprocessPreview] = useState(false);
+  const [activeNovelPreprocessTaskId, setActiveNovelPreprocessTaskId] = useState<string | null>(null);
+  const [activeEpisodePreprocessTaskId, setActiveEpisodePreprocessTaskId] = useState<string | null>(null);
+  const [novelPreprocessTaskState, setNovelPreprocessTaskState] = useState<PreprocessTaskState | null>(null);
+  const [episodePreprocessTaskState, setEpisodePreprocessTaskState] = useState<PreprocessTaskState | null>(null);
 
   // Claude 提供商切换（预处理失败重试）
   const [showClaudeProviderModal, setShowClaudeProviderModal] = useState(false);
@@ -2827,6 +3013,42 @@ const App: React.FC = () => {
   // Computed
   const currentProject = projects.find(p => p.id === currentProjectId);
   const currentEpisode = currentProject?.episodes.find(e => e.id === currentEpisodeId);
+  const projectStatsSummary = buildProjectStatsSummary(currentProject);
+
+  const recordTextUsage = useCallback(async ({
+    provider,
+    projectId,
+    taskType,
+    sourceId,
+    operationId,
+    result,
+  }: {
+    provider: 'claude' | 'gemini' | 'volcengine';
+    projectId: string;
+    taskType: string;
+    sourceId: string;
+    operationId: string;
+    result: { usage?: any; model?: string } | null | undefined;
+  }) => {
+    const payload = buildProjectTextUsagePayload({
+      provider,
+      projectId,
+      taskType,
+      sourceId,
+      operationId,
+      result,
+    });
+
+    if (!payload) {
+      return;
+    }
+
+    try {
+      await apiService.recordProjectTextUsage(projectId, payload);
+    } catch (error) {
+      console.error(`[项目统计] ${provider} token 上报失败:`, error);
+    }
+  }, []);
   const failedPreprocessEpisodes = getFailedPreprocessEpisodes(currentProject?.episodes ?? []);
   const hasAnyAssetImages = Boolean(
     currentProject && (
@@ -2959,7 +3181,6 @@ const App: React.FC = () => {
           const supportedExtractionModels = [
             'doubao-seed-2-0-pro-260215',
             'claude-sonnet-4-6',
-            'grsai-gemini-3.1-pro',
             'gemini-3-flash-preview',
             'gemini-3-pro-preview',
             'gemini-2.5-flash'
@@ -2968,6 +3189,7 @@ const App: React.FC = () => {
           let needsMigration = false;
           const migratedSettings: GlobalSettings = {
             extractionModel: loadedSettings.extractionModel,
+            preprocessModel: loadedSettings.preprocessModel || 'claude-sonnet-4-6',
             projectTypePrompts: loadedSettings.projectTypePrompts || {},
             projectTypeLabels: loadedSettings.projectTypeLabels || { ...DEFAULT_GLOBAL_SETTINGS.projectTypeLabels },
             // 剪映路径从 .env.local 读取（所有客户端共享网络驱动器）
@@ -3039,6 +3261,21 @@ const App: React.FC = () => {
     };
 
     initializeApp();
+  }, []);
+
+  // 轮询活动任务
+  useEffect(() => {
+    const pollTasks = async () => {
+      try {
+        const tasks = await getActiveTasks();
+        setActiveTasks(tasks);
+      } catch (err) {
+        console.warn('[活动任务] 获取失败:', err);
+      }
+    };
+    pollTasks();
+    const interval = setInterval(pollTasks, 5000);
+    return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
@@ -3131,6 +3368,400 @@ const App: React.FC = () => {
     setSelectedCharacterIds([]);
     setSelectedSceneIds([]);
   }, [activeTab, currentEpisodeId]);
+
+  const applyNovelPreprocessTaskResult = useCallback(async (task: PreprocessTaskState) => {
+    if (!currentProject || task.resultAppliedAt) return;
+
+    const analysis = task.results.analysis;
+    const finalScripts = task.results.finalScripts ?? task.results.segmentedScripts;
+    if (!analysis || !finalScripts || finalScripts.length === 0) {
+      throw new Error('预处理任务结果不完整，无法应用');
+    }
+
+    const episodeDrafts = task.input?.episodeDrafts && task.input.episodeDrafts.length > 0
+      ? task.input.episodeDrafts
+      : splitNovelIntoEpisodes(preprocessNovelText);
+    if (episodeDrafts.length === 0) {
+      throw new Error('当前未找到可应用的章节草稿，请重新选择原始 txt 文件');
+    }
+    if (episodeDrafts.length !== finalScripts.length) {
+      throw new Error('当前章节拆分结果与任务结果数量不一致，请重新发起预处理');
+    }
+
+    const now = Date.now();
+    const newEpisodes: Episode[] = episodeDrafts.map((draft, i) => buildEpisodeFromPreprocessResult({
+      id: uuidv4(),
+      name: draft.title,
+      scriptContent: draft.content,
+      frames: [],
+      updatedAt: now + i,
+    }, finalScripts[i] || undefined));
+
+    const existingCharNames = new Set(currentProject.characters.map(c => c.name));
+    const existingSceneNames = new Set(currentProject.scenes.map(s => s.name));
+
+    const newCharacters: Character[] = (analysis.characters || [])
+      .filter(c => !existingCharNames.has(c.name))
+      .map(c => {
+        const normalized = normalizeCharacterInput(c.name, c.aliases);
+        return { ...c, ...normalized, id: uuidv4(), aliases: normalized.aliases };
+      });
+
+    const newScenes: Scene[] = (analysis.scenes || [])
+      .filter(s => !existingSceneNames.has(s.name))
+      .map(s => ({ ...s, id: uuidv4() }));
+
+    const allCharacters = [...currentProject.characters, ...newCharacters];
+    const existingVariantKeys = new Set((currentProject.variants ?? []).map(v => `${v.characterId}::${v.name}`));
+    const newVariants: CharacterVariant[] = (analysis.variants ?? [])
+      .map(v => {
+        const char = allCharacters.find(c => c.name === v.characterName || (c.aliases ?? []).includes(v.characterName));
+        if (!char) return null;
+        const key = `${char.id}::${v.name}`;
+        if (existingVariantKeys.has(key)) return null;
+        return { id: uuidv4(), characterId: char.id, name: v.name, context: v.context, appearance: v.appearance } as CharacterVariant;
+      })
+      .filter((v): v is CharacterVariant => v !== null);
+
+    const updatedProject = {
+      ...currentProject,
+      episodes: [...currentProject.episodes, ...newEpisodes],
+      characters: [...currentProject.characters, ...newCharacters],
+      scenes: [...currentProject.scenes, ...newScenes],
+      variants: [...(currentProject.variants ?? []), ...newVariants],
+      updatedAt: Date.now(),
+    };
+
+    await apiService.updateProject(currentProject.id, updatedProject);
+    setProjects(prev => prev.map(p => p.id === currentProject.id ? updatedProject : p));
+    newEpisodes.forEach(e => savedEpisodesRef.current?.set(e.id, e.updatedAt));
+    await apiService.markPreprocessTaskApplied(task.id);
+    setNovelPreprocessTaskState(prev => prev && prev.id === task.id ? { ...prev, resultAppliedAt: Date.now() } : prev);
+
+    setShowNovelPreprocessModal(false);
+    setPreprocessNovelText('');
+
+    const secondPassFailedIndexes = task.results.secondPassFailedIndexes ?? [];
+    const failedTitles = episodeDrafts
+      .filter((_, i) => finalScripts[i]?.failed)
+      .map(d => `• ${d.title}`);
+    const secondPassFailedTitles = episodeDrafts
+      .filter((_, i) => secondPassFailedIndexes.includes(i))
+      .map(d => `• ${d.title}`);
+
+    const messages: string[] = [];
+    if (failedTitles.length > 0) {
+      messages.push(`分段失败（${failedTitles.length} 个，已用原文填充，可通过单集预处理重试）：\n${failedTitles.join('\n')}`);
+    }
+    if (secondPassFailedTitles.length > 0) {
+      messages.push(`二次加工失败（${secondPassFailedTitles.length} 个，已回退为章节原始文本）：\n${secondPassFailedTitles.join('\n')}`);
+    }
+    if (messages.length > 0) {
+      alert(`预处理完成，但存在以下问题：\n\n${messages.join('\n\n')}`);
+    }
+
+    // 自动分镜拆解
+    if (enableAutoStoryboard) {
+      const successEpisodes = newEpisodes.filter((_, i) => !finalScripts[i]?.failed);
+      if (successEpisodes.length > 0) {
+        executeAutoStoryboard(updatedProject, successEpisodes);
+      }
+    }
+  }, [currentProject, preprocessNovelText, enableAutoStoryboard]);
+
+  const applyEpisodePreprocessTaskResult = useCallback(async (task: PreprocessTaskState) => {
+    if (!currentEpisode || !task.results.episodeResult) return;
+    if (task.resultAppliedAt) return;
+
+    const result = task.results.episodeResult;
+    setEpisodePreprocessResult(result.content);
+    setShowEpisodePreprocessModal(false);
+    setShowEpisodePreprocessPreview(true);
+    await apiService.markPreprocessTaskApplied(task.id);
+    setEpisodePreprocessTaskState(prev => prev && prev.id === task.id ? { ...prev, resultAppliedAt: Date.now() } : prev);
+
+    if (result.secondPassFailed) {
+      alert('二次加工失败，预览内容已回退为分集原始文本。');
+    }
+  }, [currentEpisode]);
+
+  const executeAutoStoryboard = async (project: Project, episodes: Episode[]) => {
+    const failedList: string[] = [];
+    const total = episodes.length;
+
+    for (let i = 0; i < total; i++) {
+      const episode = episodes[i];
+      setStoryboardProgress({ current: i + 1, total, currentName: episode.name });
+
+      try {
+        const prompts = globalSettings.projectTypePrompts[project.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
+        const model = globalSettings.extractionModel;
+        const isVolcengineModel = model.startsWith('doubao');
+        const isClaudeModel = isClaudeChatModel(model);
+
+        const characterChoices = project.characters.map(c => ({ name: c.name, aliases: c.aliases ?? [] }));
+        const sceneChoices = project.scenes.map(s => ({ name: s.name }));
+        const variantChoices = (project.variants ?? []).map(v => ({
+          name: v.name,
+          characterName: project.characters.find(c => c.id === v.characterId)?.name ?? '',
+          context: v.context ?? ''
+        }));
+
+        const assetMatchingInstruction = `你必须在以下"候选资产列表"中为每个分镜匹配引用资产：
+
+1) 角色匹配规则：
+- frame.characterNames 必须只填写候选角色的 name（禁止输出别称/原文中的称呼/括号注释）
+- 允许你根据 aliases 做理解，但最终输出必须是候选的 name
+- 若该帧无可匹配角色：请输出 characterNames: [] 或直接省略 characterNames 字段
+
+2) 场景匹配规则：
+- frame.sceneNames 填写候选场景的 name 列表（可匹配多个场景，禁止输出自造场景名）
+- 若该帧无可匹配场景：请直接省略 sceneNames 字段（不要输出空数组）
+
+3) 变体资产匹配规则：
+- frame.variantNames 填写候选变体资产的 name（角色特定服装/外貌版本）
+- 当该帧场景/文本明确涉及某角色的特定服装或特殊外貌状态时，填写对应变体名
+- 变体名必须完全匹配候选变体资产的 name（禁止自造变体名）
+- 若无匹配变体：省略 variantNames 字段
+
+4) 对白输出规则：
+- 优先输出 frame.dialogues: [{ speakerName, text }, ...]
+- speakerName 必须是候选角色列表里的 name（严格一致），不要输出别称
+- narration/独白/未明确说话人：省略 speakerName（或给空字符串）
+- 一个分镜内允许多个说话人、多段对白，按出现顺序输出
+- 可选：同时输出 frame.dialogue 作为兼容字段（多行 "说话人：台词"）
+
+候选角色列表（name + aliases）：\n${JSON.stringify(characterChoices)}\n
+候选变体资产列表（name + characterName + context）：\n${JSON.stringify(variantChoices)}\n
+候选场景列表（name）：\n${JSON.stringify(sceneChoices)}\n`;
+
+        const storyboardSystemInstruction = `${prompts.storyboardBreakdown}\n\n${assetMatchingInstruction}`;
+        const breakdown = isClaudeModel
+          ? await generateStoryboardBreakdownWithClaude(episode.scriptContent, storyboardSystemInstruction)
+          : isVolcengineModel
+          ? await generateStoryboardBreakdownVolcengine(episode.scriptContent, model, storyboardSystemInstruction)
+          : await generateStoryboardBreakdownGemini(episode.scriptContent, model, storyboardSystemInstruction);
+
+        const newFrames: StoryboardFrame[] = breakdown.frames.map((f, idx) => {
+          const charIds = (f.characterNames || [])
+            .map(name => project.characters.find(c => matchesCharacter(c, name))?.id)
+            .filter((id): id is string => !!id);
+
+          const variantIds = (f.variantNames || [])
+            .map(name => (project.variants ?? []).find(v => v.name === name)?.id)
+            .filter((id): id is string => !!id);
+
+          const variantOwnerCharIds = new Set(
+            variantIds
+              .map(vid => (project.variants ?? []).find(v => v.id === vid)?.characterId)
+              .filter((id): id is string => !!id)
+          );
+          const dedupedCharIds = charIds.filter(cid => !variantOwnerCharIds.has(cid));
+
+          const sceneNames = (f.sceneNames ?? (f.sceneName ? [f.sceneName] : []));
+          const sceneIds = sceneNames
+            .map(name => project.scenes.find(s => s.name.toLowerCase().includes(name.toLowerCase()))?.id)
+            .filter((id): id is string => !!id);
+          const deduped = [...new Set(sceneIds)];
+
+          const dialogues = normalizeDialogues(f.dialogues) ?? splitDialogueStringToDialogues(f.dialogue);
+          const dialogue = mergeDialoguesToDisplayString(dialogues) ?? f.dialogue;
+
+          return {
+            id: uuidv4(),
+            index: idx,
+            imagePrompt: f.imagePrompt,
+            videoPrompt: f.videoPrompt,
+            dialogues,
+            dialogue,
+            originalText: f.originalText,
+            references: {
+              characterIds: [...new Set(dedupedCharIds)],
+              variantIds: variantIds.length > 0 ? [...new Set(variantIds)] : undefined,
+              sceneId: deduped[0],
+              sceneIds: deduped.length > 0 ? deduped : undefined,
+            }
+          };
+        });
+
+        const updatedEpisode = { ...episode, frames: newFrames, updatedAt: Date.now() };
+        await apiService.updateProject(project.id, {
+          ...project,
+          episodes: project.episodes.map(ep => ep.id === episode.id ? updatedEpisode : ep)
+        });
+        setProjects(prev => prev.map(p =>
+          p.id === project.id
+            ? { ...p, episodes: p.episodes.map(ep => ep.id === episode.id ? updatedEpisode : ep) }
+            : p
+        ));
+      } catch (error) {
+        console.error(`分镜拆解失败: ${episode.name}`, error);
+        failedList.push(episode.name);
+      }
+    }
+
+    setStoryboardProgress(null);
+    setShowNovelPreprocessModal(false);
+    setPreprocessNovelText('');
+
+    if (failedList.length > 0) {
+      alert(`分镜拆解完成，${failedList.length} 个分集失败：\n${failedList.map(n => `• ${n}`).join('\n')}`);
+    }
+  };
+
+  const startPreprocessTaskPolling = useCallback((taskId: string, type: 'novel' | 'episode') => {
+    const poll = async () => {
+      try {
+        const task = await apiService.getPreprocessTask(taskId) as PreprocessTaskState;
+        if (type === 'novel') {
+          setNovelPreprocessTaskState(task);
+          if (task.status === 'completed' && !task.resultAppliedAt) {
+            await applyNovelPreprocessTaskResult(task);
+          }
+          if (task.status === 'failed' || task.status === 'interrupted') {
+            setIsPreprocessing(false);
+          }
+          if (task.status !== 'pending' && task.status !== 'running') {
+            if (task.status === 'completed' || task.status === 'failed' || task.status === 'interrupted') {
+              setActiveNovelPreprocessTaskId(null);
+            }
+            return true;
+          }
+        }
+
+        if (type === 'episode') {
+          setEpisodePreprocessTaskState(task);
+          if (task.status === 'completed' && !task.resultAppliedAt) {
+            await applyEpisodePreprocessTaskResult(task);
+          }
+          if (task.status === 'failed' || task.status === 'interrupted') {
+            setIsEpisodePreprocessing(false);
+          }
+          if (task.status !== 'pending' && task.status !== 'running') {
+            if (task.status === 'completed' || task.status === 'failed' || task.status === 'interrupted') {
+              setActiveEpisodePreprocessTaskId(null);
+            }
+            return true;
+          }
+        }
+      } catch (error) {
+        console.error('轮询预处理任务失败:', error);
+      }
+      return false;
+    };
+
+    void poll();
+    const timer = setInterval(() => {
+      void (async () => {
+        const done = await poll();
+        if (done) clearInterval(timer);
+      })();
+    }, 2000);
+
+    return timer;
+  }, [applyNovelPreprocessTaskResult, applyEpisodePreprocessTaskResult, preprocessNovelText]);
+
+  useEffect(() => {
+    if (!currentProject) return;
+
+    let cancelled = false;
+    let novelTimer: ReturnType<typeof setInterval> | null = null;
+    let episodeTimer: ReturnType<typeof setInterval> | null = null;
+
+    const handleTaskState = async (task: PreprocessTaskState) => {
+      if (cancelled) return;
+
+      if (task.type === 'novel') {
+        setNovelPreprocessTaskState(task);
+        if (task.status === 'pending' || task.status === 'running') {
+          setIsPreprocessing(true);
+          setActiveNovelPreprocessTaskId(task.id);
+        } else {
+          setIsPreprocessing(false);
+        }
+
+        if (task.status === 'completed' && !task.resultAppliedAt && preprocessNovelText.trim()) {
+          await applyNovelPreprocessTaskResult(task);
+        }
+      }
+
+      if (task.type === 'episode') {
+        setEpisodePreprocessTaskState(task);
+        if (task.status === 'pending' || task.status === 'running') {
+          setIsEpisodePreprocessing(true);
+          setActiveEpisodePreprocessTaskId(task.id);
+        } else {
+          setIsEpisodePreprocessing(false);
+        }
+
+        if (task.status === 'completed' && !task.resultAppliedAt) {
+          await applyEpisodePreprocessTaskResult(task);
+        }
+      }
+    };
+
+    const pollTask = async (taskId: string, type: 'novel' | 'episode') => {
+      try {
+        const task = await apiService.getPreprocessTask(taskId) as PreprocessTaskState;
+        await handleTaskState(task);
+
+        if (task.status !== 'pending' && task.status !== 'running') {
+          if (type === 'novel' && novelTimer) {
+            clearInterval(novelTimer);
+            novelTimer = null;
+          }
+          if (type === 'episode' && episodeTimer) {
+            clearInterval(episodeTimer);
+            episodeTimer = null;
+          }
+        }
+      } catch (error) {
+        console.error('轮询预处理任务失败:', error);
+      }
+    };
+
+    const restoreTasks = async () => {
+      try {
+        const tasks = await apiService.listPreprocessTasks(currentProject.id) as PreprocessTaskState[];
+        if (cancelled || !Array.isArray(tasks)) return;
+
+        const latestNovel = tasks.find(task => task.type === 'novel' && !task.resultAppliedAt && (task.status === 'pending' || task.status === 'running' || task.status === 'interrupted' || task.status === 'completed')) || null;
+        const latestEpisode = tasks.find(task => task.type === 'episode' && task.episodeId === currentEpisodeId && !task.resultAppliedAt && (task.status === 'pending' || task.status === 'running' || task.status === 'interrupted' || task.status === 'completed')) || null;
+
+        if (latestNovel) {
+          await handleTaskState(latestNovel);
+          if (latestNovel.status === 'pending' || latestNovel.status === 'running') {
+            novelTimer = setInterval(() => {
+              void pollTask(latestNovel.id, 'novel');
+            }, 2000);
+          }
+        } else {
+          setNovelPreprocessTaskState(null);
+        }
+
+        if (latestEpisode) {
+          await handleTaskState(latestEpisode);
+          if (latestEpisode.status === 'pending' || latestEpisode.status === 'running') {
+            episodeTimer = setInterval(() => {
+              void pollTask(latestEpisode.id, 'episode');
+            }, 2000);
+          }
+        } else {
+          setEpisodePreprocessTaskState(null);
+        }
+      } catch (error) {
+        console.error('恢复预处理任务失败:', error);
+      }
+    };
+
+    void restoreTasks();
+
+    return () => {
+      cancelled = true;
+      if (novelTimer) clearInterval(novelTimer);
+      if (episodeTimer) clearInterval(episodeTimer);
+    };
+  }, [currentProject?.id, currentEpisodeId, preprocessNovelText, applyNovelPreprocessTaskResult, applyEpisodePreprocessTaskResult]);
 
   // Playback Logic
   useEffect(() => {
@@ -3307,7 +3938,6 @@ const App: React.FC = () => {
     const supportedExtractionModels = [
       'doubao-seed-2-0-pro-260215',
       'claude-sonnet-4-6',
-      'grsai-gemini-3.1-pro',
       'gemini-3-flash-preview',
       'gemini-3-pro-preview',
       'gemini-2.5-flash'
@@ -3349,6 +3979,7 @@ const App: React.FC = () => {
 
     return {
       extractionModel,
+      preprocessModel: loadedSettings?.preprocessModel || 'claude-sonnet-4-6',
       projectTypePrompts: normalizedPrompts,
       projectTypeLabels: mergedLabels,
       multiRefVideoModel: loadedSettings?.multiRefVideoModel,
@@ -3679,28 +4310,7 @@ const App: React.FC = () => {
       return;
     }
 
-    // 预处理前先检查两个 Claude API 的连通性，结果决定实际调用顺序
     setIsPreprocessing(true);
-    let availableProviders: Array<'univibe' | 'bltcy'> = [];
-    try {
-      const [univibeCheck, bltcyCheck] = await Promise.all([
-        checkClaudeConnectivity('univibe'),
-        checkClaudeConnectivity('bltcy'),
-      ]);
-      if (!univibeCheck.ok && !bltcyCheck.ok) {
-        alert(`两个 Claude API 均不可用，无法执行预处理：\n\n• Univibe: ${univibeCheck.error}\n• 柏拉图中转: ${bltcyCheck.error}`);
-        setIsPreprocessing(false);
-        return;
-      }
-      if (univibeCheck.ok) availableProviders.push('univibe');
-      if (bltcyCheck.ok) availableProviders.push('bltcy');
-      if (!univibeCheck.ok) console.warn(`⚠️ Univibe Claude 不可用（${univibeCheck.error}），跳过，仅使用柏拉图中转`);
-      if (!bltcyCheck.ok) console.warn(`⚠️ 柏拉图中转 Claude 不可用（${bltcyCheck.error}），跳过，仅使用 Univibe`);
-    } catch (error) {
-      alert('Claude 连通性检测异常：' + (error as Error).message);
-      setIsPreprocessing(false);
-      return;
-    }
     try {
       const prompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
       const existingContext = buildExistingAssetsContext(
@@ -3709,152 +4319,26 @@ const App: React.FC = () => {
         currentProject.variants ?? []
       );
       const systemInstruction = `${prompts.characterExtraction}\n\n${prompts.sceneExtraction}${existingContext}`;
-
-      // 截取前 8000 字用于资产提取
-      const textForAssets = preprocessNovelText.slice(0, 8000);
-      const { content: latestDirectorSkillPrompt } = await apiService.getSegmentSkillPrompt(currentProject.type);
-
-      // 按连通性检测结果顺序调用，失败时切到下一个 provider；两个都失败则 return failed 而非 throw
-      const segmentWithFallback = async (
-        text: string,
-        prompt: string,
-        label: string,
-        context: Record<string, string>
-      ): Promise<SegmentEpisodeResult> => {
-        const primary = await segmentEpisodeWithClaude(text, prompt, label, context, availableProviders[0]);
-        if (!primary.failed) return primary;
-        if (availableProviders.length < 2) return primary;
-        Logger.logError('App', `小说预处理分段失败，切换备用 Claude（${availableProviders[1]}）重试`, { label });
-        return segmentEpisodeWithClaude(text, prompt, label, context, availableProviders[1]);
-      };
-
-      // 每章分段限流为 5 并发；单集失败不中断整批，标记 preprocessSegmentFailed=true
-      const runSegmentTasksWithLimit = async () => mapWithConcurrencyLimit(
-        episodeDrafts,
-        PREPROCESS_SEGMENT_CONCURRENCY,
-        async draft => segmentWithFallback(
-          draft.content,
-          latestDirectorSkillPrompt,
-          draft.title,
-          { fullNovelText: preprocessNovelText }
-        )
-      );
-
-      // 先执行全文资产提取，再执行每章分段（5 并发）
-      let analysis: AnalysisResult;
-      try {
-        analysis = await analyzeNovelScriptWithClaude(textForAssets, systemInstruction, availableProviders[0]);
-      } catch (error) {
-        if (availableProviders.length < 2) throw error;
-        Logger.logError('App', '小说预处理资产提取失败，切换备用 Claude 重试', error);
-        analysis = await analyzeNovelScriptWithClaude(textForAssets, systemInstruction, availableProviders[1]);
-      }
-      const segmentedScripts = await runSegmentTasksWithLimit();
-
-      // 二次加工：如果启用且提示词非空，对分段成功的结果再过一遍 secondPassPrompt
+      const { content: segmentPrompt } = await apiService.getSegmentSkillPrompt(currentProject.type);
       const secondPassPrompt = prompts.preprocessSecondPassPrompt?.trim();
-      let finalScripts = segmentedScripts;
-      const secondPassFailedIndexes = new Set<number>();
-      if (enableSecondPass && secondPassPrompt) {
-        finalScripts = await mapWithConcurrencyLimit(
-          segmentedScripts,
-          PREPROCESS_SEGMENT_CONCURRENCY,
-          async (result, index) => {
-            if (result.failed) return result; // 分段失败的跳过二次加工
-            const label = episodeDrafts[index].title + '(二次加工)';
-            const secondary = await segmentWithFallback(result.content, secondPassPrompt, label, {
-              fullNovelText: preprocessNovelText,
-            });
-            if (secondary.failed) {
-              secondPassFailedIndexes.add(index);
-              return { content: episodeDrafts[index].content, failed: false }; // 回退到章节原始文本
-            }
-            return secondary;
-          }
-        );
-      }
+      const result = await apiService.createNovelPreprocessTask({
+        projectId: currentProject.id,
+        projectType: currentProject.type,
+        novelText: preprocessNovelText,
+        episodeDrafts,
+        systemInstruction,
+        segmentPrompt,
+        secondPassPrompt,
+        enableSecondPass,
+      }) as { taskId: string };
 
-      // 构建新分集（scriptContent 替换为分段结果）
-      const now = Date.now();
-      const newEpisodes: Episode[] = episodeDrafts.map((draft, i) => buildEpisodeFromPreprocessResult({
-        id: uuidv4(),
-        name: draft.title,
-        scriptContent: draft.content,
-        frames: [],
-        updatedAt: now + i,
-      }, finalScripts[i]));
-
-      // 构建新资产（按名称去重追加）
-      const existingCharNames = new Set(currentProject.characters.map(c => c.name));
-      const existingSceneNames = new Set(currentProject.scenes.map(s => s.name));
-
-      const newCharacters: Character[] = analysis.characters
-        .filter(c => !existingCharNames.has(c.name))
-        .map(c => {
-          const normalized = normalizeCharacterInput(c.name, c.aliases);
-          return { ...c, ...normalized, id: uuidv4(), aliases: normalized.aliases };
-        });
-
-      const newScenes: Scene[] = analysis.scenes
-        .filter(s => !existingSceneNames.has(s.name))
-        .map(s => ({ ...s, id: uuidv4() }));
-
-      const allCharacters = [...currentProject.characters, ...newCharacters];
-      const existingVariantKeys = new Set(
-        (currentProject.variants ?? []).map(v => `${v.characterId}::${v.name}`)
-      );
-      const newVariants: CharacterVariant[] = (analysis.variants ?? [])
-        .map(v => {
-          const char = allCharacters.find(
-            c => c.name === v.characterName || (c.aliases ?? []).includes(v.characterName)
-          );
-          if (!char) return null;
-          const key = `${char.id}::${v.name}`;
-          if (existingVariantKeys.has(key)) return null;
-          return { id: uuidv4(), characterId: char.id, name: v.name, context: v.context, appearance: v.appearance } as CharacterVariant;
-        })
-        .filter((v): v is CharacterVariant => v !== null);
-
-      const updatedProject = {
-        ...currentProject,
-        episodes: [...currentProject.episodes, ...newEpisodes],
-        characters: [...currentProject.characters, ...newCharacters],
-        scenes: [...currentProject.scenes, ...newScenes],
-        variants: [...(currentProject.variants ?? []), ...newVariants],
-        updatedAt: Date.now(),
-      };
-
-      setProjects(prev => prev.map(p => p.id === currentProject.id ? updatedProject : p));
-
-      await apiService.updateProject(currentProject.id, updatedProject);
-      newEpisodes.forEach(e => savedEpisodesRef.current?.set(e.id, e.updatedAt));
-
-      setShowNovelPreprocessModal(false);
-      setPreprocessNovelText('');
-
-      // 汇报失败情况（一次加工失败 / 二次加工失败分开列）
-      const failedTitles = episodeDrafts
-        .filter((_, i) => finalScripts[i]?.failed)
-        .map(d => `• ${d.title}`);
-      const secondPassFailedTitles = episodeDrafts
-        .filter((_, i) => secondPassFailedIndexes.has(i))
-        .map(d => `• ${d.title}`);
-
-      const messages: string[] = [];
-      if (failedTitles.length > 0) {
-        messages.push(`分段失败（${failedTitles.length} 个，已用原文填充，可通过单集预处理重试）：\n${failedTitles.join('\n')}`);
-      }
-      if (secondPassFailedTitles.length > 0) {
-        messages.push(`二次加工失败（${secondPassFailedTitles.length} 个，已回退为章节原始文本）：\n${secondPassFailedTitles.join('\n')}`);
-      }
-      if (messages.length > 0) {
-        alert(`预处理完成，但存在以下问题：\n\n${messages.join('\n\n')}`);
-      }
+      setActiveNovelPreprocessTaskId(result.taskId);
+      const task = await apiService.getPreprocessTask(result.taskId) as PreprocessTaskState;
+      setNovelPreprocessTaskState(task);
+      startPreprocessTaskPolling(result.taskId, 'novel');
     } catch (error) {
       console.error('小说预处理失败:', error);
-      const errorMsg = (error as Error).message;
-      alert('预处理失败：' + errorMsg);
-    } finally {
+      alert('预处理失败：' + (error as Error).message);
       setIsPreprocessing(false);
     }
   };
@@ -3863,80 +4347,26 @@ const App: React.FC = () => {
     if (!currentProject || !currentEpisode?.scriptContent.trim()) return;
     setIsEpisodePreprocessing(true);
     try {
-      // 预处理前先检查两个 Claude API 的连通性，结果决定实际调用顺序
-      const [univibeCheck, bltcyCheck] = await Promise.all([
-        checkClaudeConnectivity('univibe'),
-        checkClaudeConnectivity('bltcy'),
-      ]);
-      if (!univibeCheck.ok && !bltcyCheck.ok) {
-        alert(`两个 Claude API 均不可用，无法执行预处理：\n\n• Univibe: ${univibeCheck.error}\n• 柏拉图中转: ${bltcyCheck.error}`);
-        setIsEpisodePreprocessing(false);
-        return;
-      }
-      const availableProviders: Array<'univibe' | 'bltcy'> = [];
-      if (univibeCheck.ok) availableProviders.push('univibe');
-      if (bltcyCheck.ok) availableProviders.push('bltcy');
-      if (!univibeCheck.ok) console.warn(`⚠️ Univibe Claude 不可用（${univibeCheck.error}），跳过，仅使用柏拉图中转`);
-      if (!bltcyCheck.ok) console.warn(`⚠️ 柏拉图中转 Claude 不可用（${bltcyCheck.error}），跳过，仅使用 Univibe`);
-
-      const { content: skillPrompt } = await apiService.getSegmentSkillPrompt(currentProject.type);
+      const { content: segmentPrompt } = await apiService.getSegmentSkillPrompt(currentProject.type);
       const prompts = globalSettings.projectTypePrompts[currentProject.type]
         ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
-
-      // 一次分段，按连通性检测结果顺序尝试
-      let result = await segmentEpisodeWithClaude(
-        currentEpisode.scriptContent, skillPrompt, currentEpisode.name,
-        { fullNovelText: currentEpisode.scriptContent }, availableProviders[0]
-      );
-      if (result.failed && availableProviders.length > 1) {
-        Logger.logError('App', `单集预处理分段失败，切换备用 Claude（${availableProviders[1]}）重试`, { episodeTitle: currentEpisode.name });
-        const secondary = await segmentEpisodeWithClaude(
-          currentEpisode.scriptContent, skillPrompt, currentEpisode.name,
-          { fullNovelText: currentEpisode.scriptContent }, availableProviders[1]
-        );
-        if (secondary.failed) {
-          throw new Error('两个 Claude API 均无法完成分段处理，请检查网络或稍后重试');
-        }
-        result = secondary;
-      } else if (result.failed) {
-        throw new Error('Claude API 无法完成分段处理，请检查网络或稍后重试');
-      }
-
-      // 二次加工（可选）
       const secondPassPrompt = prompts.preprocessSecondPassPrompt?.trim();
-      let secondPassFailed = false;
-      if (enableEpisodeSecondPass && secondPassPrompt && !result.failed) {
-        const sp = await segmentEpisodeWithClaude(
-          result.content, secondPassPrompt, currentEpisode.name + '(二次加工)',
-          { fullNovelText: currentEpisode.scriptContent }, availableProviders[0]
-        );
-        if (!sp.failed) {
-          result = sp;
-        } else if (availableProviders.length > 1) {
-          Logger.logError('App', `单集预处理二次加工失败，切换备用 Claude（${availableProviders[1]}）重试`, { episodeTitle: currentEpisode.name });
-          const sp2 = await segmentEpisodeWithClaude(
-            result.content, secondPassPrompt, currentEpisode.name + '(二次加工)',
-            { fullNovelText: currentEpisode.scriptContent }, availableProviders[1]
-          );
-          if (!sp2.failed) {
-            result = sp2;
-          } else {
-            secondPassFailed = true;
-          }
-        } else {
-          secondPassFailed = true;
-        }
-      }
+      const result = await apiService.createEpisodePreprocessTask({
+        projectId: currentProject.id,
+        episodeId: currentEpisode.id,
+        episodeName: currentEpisode.name,
+        content: currentEpisode.scriptContent,
+        segmentPrompt,
+        secondPassPrompt,
+        enableSecondPass: enableEpisodeSecondPass,
+      }) as { taskId: string };
 
-      setEpisodePreprocessResult(secondPassFailed ? currentEpisode.scriptContent : result.content);
-      setShowEpisodePreprocessModal(false);
-      setShowEpisodePreprocessPreview(true);
-      if (secondPassFailed) {
-        alert('二次加工失败，预览内容已回退为分集原始文本。');
-      }
+      setActiveEpisodePreprocessTaskId(result.taskId);
+      const task = await apiService.getPreprocessTask(result.taskId) as PreprocessTaskState;
+      setEpisodePreprocessTaskState(task);
+      startPreprocessTaskPolling(result.taskId, 'episode');
     } catch (error) {
       alert('预处理失败：' + (error as Error).message);
-    } finally {
       setIsEpisodePreprocessing(false);
     }
   };
@@ -3954,8 +4384,16 @@ const App: React.FC = () => {
       const analysis = await analyzeNovelScriptWithClaude(
         preprocessRetryData.textForAssets,
         preprocessRetryData.systemInstruction,
-        provider
+        provider,
+        globalSettings.preprocessModel as any
       );
+      await recordTextUsage({ provider: 'claude',
+        projectId: currentProject.id,
+        taskType: 'assetExtraction',
+        sourceId: currentEpisodeId || 'novel-preprocess',
+        operationId: `retry-provider-analysis-${provider}`,
+        result: analysis,
+      });
 
       const segmentedScripts = await mapWithConcurrencyLimit(
         preprocessRetryData.episodeDrafts,
@@ -3966,8 +4404,16 @@ const App: React.FC = () => {
             preprocessRetryData.latestDirectorSkillPrompt,
             draft.title,
             { fullNovelText: preprocessNovelText },
-            provider
+            provider,
+            globalSettings.preprocessModel as any
           );
+          await recordTextUsage({ provider: 'claude',
+            projectId: currentProject.id,
+            taskType: 'preprocessSegment',
+            sourceId: draft.title,
+            operationId: `retry-provider-primary-${provider}`,
+            result,
+          });
           if (result.failed) {
             throw new Error(`分集「${draft.title}」Claude API 失败，预处理中断`);
           }
@@ -3988,7 +4434,14 @@ const App: React.FC = () => {
             const label = preprocessRetryData.episodeDrafts[index].title + '(二次加工)';
             const secondPassResult = await segmentEpisodeWithClaude(result.content, retrySecondPassPrompt, label, {
               fullNovelText: preprocessNovelText,
-            }, provider);
+            }, provider, globalSettings.preprocessModel as any);
+            await recordTextUsage({ provider: 'claude',
+              projectId: currentProject.id,
+              taskType: 'preprocessSecondPass',
+              sourceId: preprocessRetryData.episodeDrafts[index].title,
+              operationId: `retry-provider-second-pass-${provider}`,
+              result: secondPassResult,
+            });
             return secondPassResult.failed ? result : secondPassResult;
           }
         );
@@ -4072,14 +4525,28 @@ const App: React.FC = () => {
         async episode => {
           const primary = await segmentEpisodeWithClaude(episode.scriptContent, latestDirectorSkillPrompt, episode.name, {
             fullNovelText: preprocessNovelText || undefined,
-          }, 'univibe');
+          }, 'univibe', globalSettings.preprocessModel as any);
+          await recordTextUsage({ provider: 'claude',
+            projectId: currentProject.id,
+            taskType: 'preprocessSegment',
+            sourceId: episode.id,
+            operationId: 'retry-failed-primary-univibe',
+            result: primary,
+          });
           if (!primary.failed) return primary;
           Logger.logError('App', '预处理分集重试失败，切换柏拉图中转 Claude 重试', {
             episodeName: episode.name
           });
           const secondary = await segmentEpisodeWithClaude(episode.scriptContent, latestDirectorSkillPrompt, episode.name, {
             fullNovelText: preprocessNovelText || undefined,
-          }, 'bltcy');
+          }, 'bltcy', globalSettings.preprocessModel as any);
+          await recordTextUsage({ provider: 'claude',
+            projectId: currentProject.id,
+            taskType: 'preprocessSegment',
+            sourceId: episode.id,
+            operationId: 'retry-failed-secondary-bltcy',
+            result: secondary,
+          });
           if (secondary.failed) {
             throw new Error(`分集「${episode.name}」两个 Claude API 均失败，重试中断`);
           }
@@ -4112,32 +4579,105 @@ const App: React.FC = () => {
     }
   };
 
-  const handleDeleteEpisode = (e: React.MouseEvent, episodeId: string) => {
+  const handleDeleteEpisode = async (e: React.MouseEvent, episodeId: string) => {
     e.stopPropagation();
     if (!currentProject) return;
-    if (confirm("确定要删除此分集吗？")) {
-      // 直接修改 episodes 数组，不触发项目级保存
+    if (!confirm('确定要删除此分集吗？删除后可在分集回收站中恢复。')) return;
+
+    try {
+      await apiService.deleteEpisode(currentProject.id, episodeId);
+
+      // API 成功后再更新前端 state
       setProjects(prev => prev.map(p =>
         p.id === currentProject.id
           ? { ...p, episodes: p.episodes.filter(ep => ep.id !== episodeId) }
           : p
       ));
-
-      // 删除分集的保存快照
       savedEpisodesRef.current?.delete(episodeId);
+    } catch (error) {
+      console.error('删除分集失败:', error);
+      alert('删除分集失败：' + (error as Error).message);
     }
   };
 
-  const handleDeleteSelectedEpisodes = () => {
+  const handleDeleteSelectedEpisodes = async () => {
     if (!currentProject || selectedEpisodeIds.size === 0) return;
-    if (!confirm(`确定要删除选中的 ${selectedEpisodeIds.size} 个分集吗？`)) return;
-    setProjects(prev => prev.map(p =>
-      p.id === currentProject.id
-        ? { ...p, episodes: p.episodes.filter(ep => !selectedEpisodeIds.has(ep.id)) }
-        : p
-    ));
-    selectedEpisodeIds.forEach(id => savedEpisodesRef.current?.delete(id));
-    setSelectedEpisodeIds(new Set());
+    if (!confirm(`确定要删除选中的 ${selectedEpisodeIds.size} 个分集吗？删除后可在分集回收站中恢复。`)) return;
+
+    const idsToDelete = [...selectedEpisodeIds];
+    try {
+      // 串行执行，避免 LowDB 并发写覆盖
+      for (const id of idsToDelete) {
+        await apiService.deleteEpisode(currentProject.id, id);
+      }
+
+      // 全部成功后更新 state
+      setProjects(prev => prev.map(p =>
+        p.id === currentProject.id
+          ? { ...p, episodes: p.episodes.filter(ep => !selectedEpisodeIds.has(ep.id)) }
+          : p
+      ));
+      idsToDelete.forEach(id => savedEpisodesRef.current?.delete(id));
+      setSelectedEpisodeIds(new Set());
+    } catch (error) {
+      console.error('批量删除分集失败:', error);
+      alert('批量删除分集失败：' + (error as Error).message);
+    }
+  };
+
+  // ==================== 分集回收站 ====================
+
+  const handleOpenEpisodeRecycleBin = async () => {
+    if (!currentProject) return;
+    setShowEpisodeRecycleBinModal(true);
+    setIsEpisodeRecycleBinLoading(true);
+    try {
+      const data = await apiService.getEpisodeRecycleBin(currentProject.id);
+      // 按删除时间倒序排列（最近删的在最前面）
+      setEpisodeRecycleBin(
+        [...data].sort((a: any, b: any) => (b.deletedAt || 0) - (a.deletedAt || 0))
+      );
+    } catch (error) {
+      console.error('获取分集回收站失败:', error);
+      alert('获取分集回收站失败：' + (error as Error).message);
+    } finally {
+      setIsEpisodeRecycleBinLoading(false);
+    }
+  };
+
+  const handleRestoreEpisode = async (episodeId: string) => {
+    if (!currentProject) return;
+    try {
+      const restored = await apiService.restoreEpisode(currentProject.id, episodeId);
+
+      // 从回收站 UI 中移除
+      setEpisodeRecycleBin(prev => prev.filter(ep => ep.id !== episodeId));
+
+      // 将恢复的分集追加到项目 episodes 末尾
+      setProjects(prev => prev.map(p =>
+        p.id === currentProject.id
+          ? { ...p, episodes: [...p.episodes, restored] }
+          : p
+      ));
+
+      // 初始化恢复分集的保存快照
+      savedEpisodesRef.current?.set(restored.id, restored.updatedAt);
+    } catch (error) {
+      console.error('恢复分集失败:', error);
+      alert('恢复分集失败：' + (error as Error).message);
+    }
+  };
+
+  const handlePermanentDeleteEpisode = async (episodeId: string) => {
+    if (!confirm('确定要永久删除此分集吗？此操作不可撤销。')) return;
+    if (!currentProject) return;
+    try {
+      await apiService.deleteEpisodePermanently(currentProject.id, episodeId);
+      setEpisodeRecycleBin(prev => prev.filter(ep => ep.id !== episodeId));
+    } catch (error) {
+      console.error('永久删除分集失败:', error);
+      alert('永久删除分集失败：' + (error as Error).message);
+    }
   };
 
   const handleRenameEpisode = (e: React.MouseEvent, episodeId: string) => {
@@ -4354,9 +4894,9 @@ const App: React.FC = () => {
   const handleSelectMissing = (type: 'image' | 'video' | 'audio') => {
       if (!currentEpisode) return;
       let ids: string[] = [];
-      if (type === 'image') ids = currentEpisode.frames.filter(f => !f.imageUrl).map(f => f.id);
-      if (type === 'video') ids = currentEpisode.frames.filter(f => !f.videoUrl).map(f => f.id);
-      if (type === 'audio') ids = currentEpisode.frames.filter(f => !f.audioUrl).map(f => f.id);
+      if (type === 'image') ids = currentEpisode.frames.filter(f => !f.imageUrl && !f.isGenerating).map(f => f.id);
+      if (type === 'video') ids = currentEpisode.frames.filter(f => !f.videoUrl && !f.isGeneratingVideo && f.videoTaskStatus !== 'waiting').map(f => f.id);
+      if (type === 'audio') ids = currentEpisode.frames.filter(f => !f.audioUrl && !f.isGeneratingAudio).map(f => f.id);
       setSelectedFrameIds(ids);
   };
 
@@ -4788,8 +5328,9 @@ const App: React.FC = () => {
           const file = (e.target as HTMLInputElement).files?.[0];
           if (!file) return;
           const reader = new FileReader();
-          reader.onloadend = () => {
-              const imageUrl = reader.result as string;
+          reader.onloadend = async () => {
+              const base64Data = reader.result as string;
+              const imageUrl = await uploadImageIfBase64(base64Data, `variant_${variantId}_${Date.now()}`);
               const updatedVariants = (currentProject.variants ?? []).map(v => v.id === variantId ? { ...v, imageUrl } : v);
               handleUpdateProject(currentProject.id, { variants: updatedVariants });
           };
@@ -4812,8 +5353,6 @@ const App: React.FC = () => {
       const model = currentProject.settings.imageModel;
       const isBananaProModel = isBananaProImageModel(model);
       const isVolcengineModel = isVolcengineImageModel(model);
-      const isXskillModel = isXskillNanoBanana2Model(model);
-      const isJarvisModel = isJarvisNanoBanana2Model(model);
       const isBltcyModel = isBltcyBanana2Model(model);
       const isBltcyNanoBananaHd = isBltcyNanoBananaHdModel(model);
       const charReferenceImages: { name: string; data: string; mimeType: string }[] = [];
@@ -4855,28 +5394,6 @@ const App: React.FC = () => {
                           }));
                       },
                       model
-                  );
-              } else if (isXskillModel) {
-                  // 使用速推nano banana2服务
-                  imageUrl = await generateImageWithXskillNanoBanana2(
-                      prompt, '16:9', charReferenceImages, projectId,
-                      (progress) => {
-                          setProjects(prev => prev.map(p => p.id !== projectId ? p : {
-                              ...p,
-                              variants: (p.variants ?? []).map(v => v.id === variantId ? { ...v, progress, error: undefined } : v)
-                          }));
-                      }
-                  );
-              } else if (isJarvisModel) {
-                  // 使用贾维斯中转nano banana2服务
-                  imageUrl = await generateImageWithJarvisNanoBanana2(
-                      prompt, '16:9', charReferenceImages, projectId,
-                      (progress) => {
-                          setProjects(prev => prev.map(p => p.id !== projectId ? p : {
-                              ...p,
-                              variants: (p.variants ?? []).map(v => v.id === variantId ? { ...v, progress, error: undefined } : v)
-                          }));
-                      }
                   );
               } else if (isBltcyModel) {
                   // 使用柏拉图 One-API banana2 (2K)
@@ -5009,24 +5526,43 @@ const App: React.FC = () => {
       // 2. Extract Assets - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
       const isClaudeModel = isClaudeChatModel(model);
-      const isGrsaiModel = isGrsaiChatModel(model);
-      const analyzeNovelScript = isVolcengineModel
-        ? analyzeNovelScriptVolcengine
-        : isClaudeModel
-        ? analyzeNovelScriptWithClaude
-        : isGrsaiModel
-        ? analyzeNovelScriptWithGrsai
-        : analyzeNovelScriptGemini;
-      const resolvedModel = isGrsaiModel ? getGrsaiChatModelName(model) : model;
 
       Logger.logInfo('选择的服务', {
-        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : isGrsaiModel ? 'Grsai' : 'Gemini',
-        model: resolvedModel
+        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : 'Gemini',
+        model
       });
 
       const analysis = isClaudeModel
-        ? await analyzeNovelScriptWithClaude(currentEpisode.scriptContent, systemInstruction)
-        : await analyzeNovelScript(currentEpisode.scriptContent, resolvedModel, systemInstruction);
+        ? await analyzeNovelScriptWithClaude(currentEpisode.scriptContent, systemInstruction, undefined, globalSettings.preprocessModel as any)
+        : isVolcengineModel
+        ? await analyzeNovelScriptVolcengine(currentEpisode.scriptContent, model, systemInstruction)
+        : await analyzeNovelScriptGemini(currentEpisode.scriptContent, model, systemInstruction);
+
+      if (isClaudeModel) {
+        await recordTextUsage({ provider: 'claude',
+          projectId: currentProject.id,
+          taskType: 'assetExtraction',
+          sourceId: currentEpisode.id,
+          operationId: 'extract-assets',
+          result: analysis as { usage?: any; model?: string },
+        });
+      } else if (isVolcengineModel) {
+        await recordTextUsage({ provider: 'volcengine',
+          projectId: currentProject.id,
+          taskType: 'assetExtraction',
+          sourceId: currentEpisode.id,
+          operationId: 'extract-assets',
+          result: analysis as { usage?: any; model?: string },
+        });
+      } else {
+        await recordTextUsage({ provider: 'gemini',
+          projectId: currentProject.id,
+          taskType: 'assetExtraction',
+          sourceId: currentEpisode.id,
+          operationId: 'extract-assets',
+          result: analysis as { usage?: any; model?: string },
+        });
+      }
 
       Logger.logInfo('角色和场景提取完成', {
         charactersCount: analysis.characters.length,
@@ -5149,24 +5685,43 @@ const App: React.FC = () => {
       // 2. Extract Characters - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
       const isClaudeModel = isClaudeChatModel(model);
-      const isGrsaiModel = isGrsaiChatModel(model);
-      const analyzeNovelScript = isVolcengineModel
-        ? analyzeNovelScriptVolcengine
-        : isClaudeModel
-        ? analyzeNovelScriptWithClaude
-        : isGrsaiModel
-        ? analyzeNovelScriptWithGrsai
-        : analyzeNovelScriptGemini;
-      const resolvedModel = isGrsaiModel ? getGrsaiChatModelName(model) : model;
 
       Logger.logInfo('选择的服务', {
-        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : isGrsaiModel ? 'Grsai' : 'Gemini',
-        model: resolvedModel
+        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : 'Gemini',
+        model
       });
 
       const analysis = isClaudeModel
-        ? await analyzeNovelScriptWithClaude(currentEpisode.scriptContent, systemInstruction)
-        : await analyzeNovelScript(currentEpisode.scriptContent, resolvedModel, systemInstruction);
+        ? await analyzeNovelScriptWithClaude(currentEpisode.scriptContent, systemInstruction, undefined, globalSettings.preprocessModel as any)
+        : isVolcengineModel
+        ? await analyzeNovelScriptVolcengine(currentEpisode.scriptContent, model, systemInstruction)
+        : await analyzeNovelScriptGemini(currentEpisode.scriptContent, model, systemInstruction);
+
+      if (isClaudeModel) {
+        await recordTextUsage({ provider: 'claude',
+          projectId: currentProject.id,
+          taskType: 'assetExtraction',
+          sourceId: currentEpisode.id,
+          operationId: 'extract-characters',
+          result: analysis as { usage?: any; model?: string },
+        });
+      } else if (isVolcengineModel) {
+        await recordTextUsage({ provider: 'volcengine',
+          projectId: currentProject.id,
+          taskType: 'assetExtraction',
+          sourceId: currentEpisode.id,
+          operationId: 'extract-characters',
+          result: analysis as { usage?: any; model?: string },
+        });
+      } else {
+        await recordTextUsage({ provider: 'gemini',
+          projectId: currentProject.id,
+          taskType: 'assetExtraction',
+          sourceId: currentEpisode.id,
+          operationId: 'extract-characters',
+          result: analysis as { usage?: any; model?: string },
+        });
+      }
 
       Logger.logInfo('人物提取完成', {
         charactersCount: (analysis.characters ?? []).length,
@@ -5283,24 +5838,48 @@ const App: React.FC = () => {
       // 2. Extract Scenes - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
       const isClaudeModel = isClaudeChatModel(model);
-      const isGrsaiModel = isGrsaiChatModel(model);
       const analyzeNovelScript = isVolcengineModel
         ? analyzeNovelScriptVolcengine
         : isClaudeModel
         ? analyzeNovelScriptWithClaude
-        : isGrsaiModel
-        ? analyzeNovelScriptWithGrsai
         : analyzeNovelScriptGemini;
-      const resolvedModel = isGrsaiModel ? getGrsaiChatModelName(model) : model;
 
       Logger.logInfo('选择的服务', {
-        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : isGrsaiModel ? 'Grsai' : 'Gemini',
-        model: resolvedModel
+        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : 'Gemini',
+        model
       });
 
       const analysis = isClaudeModel
-        ? await analyzeNovelScriptWithClaude(currentEpisode.scriptContent, systemInstruction)
-        : await analyzeNovelScript(currentEpisode.scriptContent, resolvedModel, systemInstruction);
+        ? await analyzeNovelScriptWithClaude(currentEpisode.scriptContent, systemInstruction, undefined, globalSettings.preprocessModel as any)
+        : isVolcengineModel
+        ? await analyzeNovelScriptVolcengine(currentEpisode.scriptContent, model, systemInstruction)
+        : await analyzeNovelScriptGemini(currentEpisode.scriptContent, model, systemInstruction);
+
+      if (isClaudeModel) {
+        await recordTextUsage({ provider: 'claude',
+          projectId: currentProject.id,
+          taskType: 'assetExtraction',
+          sourceId: currentEpisode.id,
+          operationId: 'extract-scenes',
+          result: analysis as { usage?: any; model?: string },
+        });
+      } else if (isVolcengineModel) {
+        await recordTextUsage({ provider: 'volcengine',
+          projectId: currentProject.id,
+          taskType: 'assetExtraction',
+          sourceId: currentEpisode.id,
+          operationId: 'extract-scenes',
+          result: analysis as { usage?: any; model?: string },
+        });
+      } else {
+        await recordTextUsage({ provider: 'gemini',
+          projectId: currentProject.id,
+          taskType: 'assetExtraction',
+          sourceId: currentEpisode.id,
+          operationId: 'extract-scenes',
+          result: analysis as { usage?: any; model?: string },
+        });
+      }
 
       Logger.logInfo('场景提取完成', {
         scenesCount: (analysis.scenes ?? []).length
@@ -5374,19 +5953,15 @@ const App: React.FC = () => {
       // 2. Breakdown Storyboard - 根据模型选择不同的服务
       const isVolcengineModel = model.startsWith('doubao');
       const isClaudeModel = isClaudeChatModel(model);
-      const isGrsaiModel = isGrsaiChatModel(model);
       const generateStoryboardBreakdown = isVolcengineModel
         ? generateStoryboardBreakdownVolcengine
         : isClaudeModel
         ? generateStoryboardBreakdownWithClaude
-        : isGrsaiModel
-        ? generateStoryboardBreakdownWithGrsai
         : generateStoryboardBreakdownGemini;
-      const resolvedModel = isGrsaiModel ? getGrsaiChatModelName(model) : model;
 
       Logger.logInfo('选择的服务', {
-        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : isGrsaiModel ? 'Grsai' : 'Gemini',
-        model: resolvedModel
+        service: isVolcengineModel ? '火山引擎' : isClaudeModel ? 'Claude' : 'Gemini',
+        model
       });
 
       const characterChoices = currentProject.characters.map(c => ({
@@ -5430,8 +6005,36 @@ const App: React.FC = () => {
 
       const storyboardSystemInstruction = `${prompts.storyboardBreakdown}\n\n${assetMatchingInstruction}`;
       const breakdown = isClaudeModel
-        ? await generateStoryboardBreakdownWithClaude(currentEpisode.scriptContent, storyboardSystemInstruction)
-        : await generateStoryboardBreakdown(currentEpisode.scriptContent, resolvedModel, storyboardSystemInstruction);
+        ? await generateStoryboardBreakdownWithClaude(currentEpisode.scriptContent, storyboardSystemInstruction, undefined, globalSettings.preprocessModel as any)
+        : isVolcengineModel
+        ? await generateStoryboardBreakdownVolcengine(currentEpisode.scriptContent, model, storyboardSystemInstruction)
+        : await generateStoryboardBreakdownGemini(currentEpisode.scriptContent, model, storyboardSystemInstruction);
+
+      if (isClaudeModel) {
+        await recordTextUsage({ provider: 'claude',
+          projectId: currentProject.id,
+          taskType: 'storyboardBreakdown',
+          sourceId: currentEpisode.id,
+          operationId: 'generate-storyboard',
+          result: breakdown as { usage?: any; model?: string },
+        });
+      } else if (isVolcengineModel) {
+        await recordTextUsage({ provider: 'volcengine',
+          projectId: currentProject.id,
+          taskType: 'storyboardBreakdown',
+          sourceId: currentEpisode.id,
+          operationId: 'generate-storyboard',
+          result: breakdown as { usage?: any; model?: string },
+        });
+      } else {
+        await recordTextUsage({ provider: 'gemini',
+          projectId: currentProject.id,
+          taskType: 'storyboardBreakdown',
+          sourceId: currentEpisode.id,
+          operationId: 'generate-storyboard',
+          result: breakdown as { usage?: any; model?: string },
+        });
+      }
 
       Logger.logInfo('分镜分解完成', {
         framesCount: breakdown.frames.length
@@ -5639,8 +6242,6 @@ const App: React.FC = () => {
     const model = currentProject.settings.storyboardImageModel ?? currentProject.settings.imageModel;
     const isBananaProModel = isBananaProImageModel(model);
     const isVolcengineModel = isVolcengineImageModel(model);
-    const isXskillModel = isXskillNanoBanana2Model(model);
-    const isJarvisModel = isJarvisNanoBanana2Model(model);
     const isBltcyModel = isBltcyBanana2Model(model);
     const isBltcyNanoBananaHd = isBltcyNanoBananaHdModel(model);
     const frame = currentEpisode.frames.find(f => f.id === frameId);
@@ -5795,66 +6396,6 @@ const App: React.FC = () => {
               });
             },
             model
-          );
-        } else if (isXskillModel) {
-          // 使用速推nano banana2服务
-          imageUrl = await generateImageWithXskillNanoBanana2(
-            `${prefix}\n\n${prompt}`,
-            aspectRatio,
-            referenceImages,
-            projectId,
-            (progress) => {
-              setProjects(prevProjects => {
-                const newProjects = [...prevProjects];
-                const projIndex = newProjects.findIndex(p => p.id === projectId);
-                if (projIndex === -1) return prevProjects;
-
-                const newProj = { ...newProjects[projIndex] };
-                const epIndex = newProj.episodes.findIndex(e => e.id === episodeId);
-                if (epIndex === -1) return prevProjects;
-
-                newProj.episodes[epIndex].frames = newProj.episodes[epIndex].frames.map(f =>
-                  f.id === frameId ? {
-                    ...f,
-                    isGenerating: true,
-                    imageProgress: progress,
-                    imageError: undefined
-                  } : f
-                );
-                newProjects[projIndex] = newProj;
-                return newProjects;
-              });
-            }
-          );
-        } else if (isJarvisModel) {
-          // 使用贾维斯中转nano banana2服务
-          imageUrl = await generateImageWithJarvisNanoBanana2(
-            `${prefix}\n\n${prompt}`,
-            aspectRatio,
-            referenceImages,
-            projectId,
-            (progress) => {
-              setProjects(prevProjects => {
-                const newProjects = [...prevProjects];
-                const projIndex = newProjects.findIndex(p => p.id === projectId);
-                if (projIndex === -1) return prevProjects;
-
-                const newProj = { ...newProjects[projIndex] };
-                const epIndex = newProj.episodes.findIndex(e => e.id === episodeId);
-                if (epIndex === -1) return prevProjects;
-
-                newProj.episodes[epIndex].frames = newProj.episodes[epIndex].frames.map(f =>
-                  f.id === frameId ? {
-                    ...f,
-                    isGenerating: true,
-                    imageProgress: progress,
-                    imageError: undefined
-                  } : f
-                );
-                newProjects[projIndex] = newProj;
-                return newProjects;
-              });
-            }
           );
         } else if (isBltcyModel) {
           // 使用柏拉图 One-API banana2 (2K)
@@ -6070,6 +6611,78 @@ const App: React.FC = () => {
     enqueueFrameVideoGeneration(currentProject, currentEpisode, frameId);
   };
 
+  const handleCancelFrameVideo = (frameId: string) => {
+    if (!currentProject || !currentEpisode) return;
+    const cancelled = taskQueue.cancelByTarget(frameId);
+    if (cancelled) {
+      persistFrameVideoState(currentProject.id, currentEpisode.id, frameId, frame => ({
+        ...frame,
+        videoTaskStatus: undefined,
+        videoQueuePosition: undefined,
+        videoProgress: undefined,
+      }));
+    }
+  };
+
+  const handleRefetchVideoResult = async (frameId: string) => {
+    if (!currentProject || !currentEpisode) return;
+    const frame = currentEpisode.frames.find(f => f.id === frameId);
+    if (!frame) return;
+
+    try {
+      let videoUrl: string;
+
+      if (frame.seedanceTaskId) {
+        // 有任务ID：重新轮询获取最新URL
+        persistFrameVideoState(currentProject.id, currentEpisode.id, frameId, f => ({
+          ...f,
+          isGeneratingVideo: true,
+          videoTaskStatus: 'loading',
+          videoQueuePosition: undefined,
+          videoProgress: f.videoProgress ?? 0,
+          videoError: undefined,
+          seedanceTaskUpdatedAt: Date.now(),
+        }));
+
+        videoUrl = await pollJimengSeedanceTask(frame.seedanceTaskId, (progress) => {
+          persistFrameVideoState(currentProject.id, currentEpisode.id, frameId, f => ({
+            ...f,
+            isGeneratingVideo: true,
+            videoTaskStatus: 'loading',
+            videoQueuePosition: undefined,
+            videoProgress: progress,
+            videoError: undefined,
+            seedanceTaskUpdatedAt: Date.now(),
+          }));
+        });
+
+        if (!videoUrl.startsWith('/api/media/')) {
+          const savedVideo = await apiService.saveExternalVideo(videoUrl, `${currentProject.id}_${currentEpisode.id}_${frameId}_video`);
+          videoUrl = savedVideo.url;
+        }
+        videoUrl = apiService.toAbsoluteApiUrl(videoUrl);
+
+        await commitFrameVideoSuccess(currentProject.id, currentEpisode.id, frameId, videoUrl, frame.videoDuration);
+      } else if (frame.videoUrl && (frame.videoUrl.includes('jimeng.com') || frame.videoUrl.includes('vlabvod.com'))) {
+        // 无任务ID但有即梦URL：通过后端代理保存
+        const savedVideo = await apiService.saveExternalVideo(frame.videoUrl, `${currentProject.id}_${currentEpisode.id}_${frameId}_video`);
+        videoUrl = apiService.toAbsoluteApiUrl(savedVideo.url);
+
+        persistFrameVideoState(currentProject.id, currentEpisode.id, frameId, f => ({
+          ...f,
+          videoUrl,
+        }));
+
+        alert('视频已通过代理保存，请关闭弹窗重新打开查看');
+      } else {
+        alert('该分镜无法重新获取：既没有任务ID，也不是即梦视频');
+      }
+    } catch (error) {
+      console.error('重新获取视频失败:', error);
+      alert(`重新获取失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   const handleGenerateFrameAudio = async (frameId: string) => {
     if (!currentProject || !currentEpisode) return;
     
@@ -6254,10 +6867,34 @@ const App: React.FC = () => {
 
   // --- Views ---
 
+  // Task Progress Bar (shown across all views)
+  const taskProgressBar = activeTasks.length > 0 && (
+    <div className="fixed top-0 left-0 right-0 bg-blue-900/95 backdrop-blur-sm border-b border-blue-700 z-50 px-4 py-2">
+      <div className="flex items-center gap-4 overflow-x-auto">
+        <span className="text-sm font-medium text-blue-200 whitespace-nowrap">正在生成 ({activeTasks.length}):</span>
+        {activeTasks.map(task => {
+          const project = projects.find(p => p.id === task.projectId);
+          const episode = project?.episodes.find(e => e.id === task.episodeId);
+          const frameIndex = episode?.frames.findIndex(f => f.id === task.frameId);
+          return (
+            <div key={task.id} className="flex items-center gap-2 bg-blue-800/50 px-3 py-1 rounded text-xs whitespace-nowrap">
+              <Loader2 size={12} className="animate-spin text-blue-300" />
+              <span className="text-blue-100">
+                {project?.name || '未知项目'} / {episode?.name || '未知分集'} / 分镜#{(frameIndex ?? -1) + 1}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+
   // 1. Project List View
   if (viewMode === ViewMode.PROJECT_LIST) {
     return (
-      <div className="min-h-screen bg-gray-900 text-white p-8 relative">
+      <>
+        {taskProgressBar}
+        <div className={`min-h-screen bg-gray-900 text-white p-8 relative ${activeTasks.length > 0 ? 'pt-20' : ''}`}>
         <div className="max-w-6xl mx-auto">
           <header className="flex justify-between items-center mb-12">
             <div>
@@ -6518,7 +7155,6 @@ const App: React.FC = () => {
                                 className="w-full bg-gray-900 border border-gray-600 rounded p-2 text-white text-sm"
                               >
                                 <option value="nano-banana-pro-vt">grsai中转_香蕉pro (推荐)</option>
-                                <option value="nano-banana-2">grsai中转_nano-banana-2</option>
                                 <option value="bltcy-banana-2">柏拉图中转_banana2 (2K)</option>
                                 <option value="bltcy-nano-banana-hd">柏拉图中转_nano banana (HD)</option>
             <option value="bltcy-nano-banana-pro">柏拉图中转_nano banana pro</option>
@@ -6539,7 +7175,6 @@ const App: React.FC = () => {
                                 className="w-full bg-gray-900 border border-gray-600 rounded p-2 text-white text-sm"
                               >
                                 <option value="nano-banana-pro-vt">grsai中转_香蕉pro (推荐)</option>
-                                <option value="nano-banana-2">grsai中转_nano-banana-2</option>
                                 <option value="bltcy-banana-2">柏拉图中转_banana2 (2K)</option>
                                 <option value="bltcy-nano-banana-hd">柏拉图中转_nano banana (HD)</option>
             <option value="bltcy-nano-banana-pro">柏拉图中转_nano banana pro</option>
@@ -6609,7 +7244,8 @@ const App: React.FC = () => {
              </div>
           </div>
         )}
-      </div>
+        </div>
+      </>
     );
   }
 
@@ -6618,9 +7254,11 @@ const App: React.FC = () => {
     if (!currentProject) return null;
 
     return (
-      <div className="h-screen h-[100dvh] bg-gray-900 text-white flex flex-col overflow-hidden">
+      <>
+        {taskProgressBar}
+        <div className="h-screen h-[100dvh] bg-gray-900 text-white flex flex-col overflow-hidden">
         {/* Header */}
-        <header className="h-16 bg-gray-950 border-b border-gray-800 flex items-center justify-between px-6 shrink-0">
+        <header className={`h-16 bg-gray-950 border-b border-gray-800 flex items-center justify-between px-6 shrink-0 ${activeTasks.length > 0 ? 'mt-14' : ''}`}>
            <div className="flex items-center gap-4">
               <button 
                 onClick={() => { setSelectedEpisodeIds(new Set()); setViewMode(ViewMode.PROJECT_LIST); }}
@@ -6715,12 +7353,47 @@ const App: React.FC = () => {
                   <FileText size={18} /> 小说预处理
                 </button>
                 <button
+                  onClick={handleOpenEpisodeRecycleBin}
+                  className="bg-gray-700 hover:bg-gray-600 text-gray-300 px-5 py-2.5 rounded-lg flex items-center gap-2 font-medium transition-all"
+                  title="分集回收站"
+                >
+                  <Trash2 size={18} /> 回收站
+                </button>
+                <button
                   onClick={handleCreateEpisode}
                   className="bg-purple-600 hover:bg-purple-500 text-white px-5 py-2.5 rounded-lg flex items-center gap-2 font-medium transition-all"
                 >
                   <Plus size={18} /> 新建分集
                 </button>
               </div>
+           </div>
+
+           <div className="mb-6 bg-gray-800/40 border border-gray-700/80 rounded-2xl p-5 sm:p-6">
+             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+               <div className="space-y-1">
+                 <h3 className="text-lg font-semibold text-white">项目统计</h3>
+                 <p className="text-sm text-gray-400 leading-relaxed">当前为{projectStatsSummary.phaseLabel}能力，只统计已接入范围，历史数据不回填。</p>
+               </div>
+               <div className="text-xs text-gray-500 lg:text-right">
+                 <div>覆盖范围：{projectStatsSummary.coverageText}</div>
+                 <div>启用时间：{projectStatsSummary.activatedAtText}</div>
+                 <div>最近更新：{projectStatsSummary.lastUpdatedAtText}</div>
+               </div>
+             </div>
+             <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+               <div className="rounded-xl border border-gray-700 bg-gray-900/60 p-4">
+                 <div className="text-xs text-gray-500">文本 Token 总量</div>
+                 <div className="mt-2 text-2xl font-semibold text-white">{projectStatsSummary.totalTokens.toLocaleString()}</div>
+               </div>
+               <div className="rounded-xl border border-gray-700 bg-gray-900/60 p-4">
+                 <div className="text-xs text-gray-500">文本请求次数</div>
+                 <div className="mt-2 text-2xl font-semibold text-white">{projectStatsSummary.requestCount.toLocaleString()}</div>
+               </div>
+               <div className="rounded-xl border border-gray-700 bg-gray-900/60 p-4">
+                 <div className="text-xs text-gray-500">Seedance 成功视频累计</div>
+                 <div className="mt-2 text-2xl font-semibold text-white">{projectStatsSummary.seedanceSuccessCount.toLocaleString()}</div>
+               </div>
+             </div>
            </div>
 
            <div className="grid grid-cols-1 gap-4">
@@ -6824,7 +7497,11 @@ const App: React.FC = () => {
                 <h2 className="text-xl font-bold flex items-center gap-2">
                   <FileText size={18} className="text-purple-400" /> 小说预处理
                 </h2>
-                <button onClick={() => { setShowNovelPreprocessModal(false); setPreprocessNovelText(''); }} className="text-gray-400 hover:text-white">
+                <button
+                  onClick={() => { setShowNovelPreprocessModal(false); setPreprocessNovelText(''); }}
+                  className="text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                  disabled={!!storyboardProgress}
+                >
                   <X size={24} />
                 </button>
               </div>
@@ -6877,6 +7554,32 @@ const App: React.FC = () => {
                   );
                 })()}
                 <p className="text-xs text-gray-500">资产提取将使用文本前 8000 字；分集将追加到现有列表。</p>
+                {novelPreprocessTaskState && !novelPreprocessTaskState.resultAppliedAt && (
+                  <div className="bg-gray-900 rounded-lg p-4 border border-gray-700 space-y-2">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-gray-300">任务状态</span>
+                      <span className={`font-medium ${novelPreprocessTaskState.status === 'completed' ? 'text-green-400' : novelPreprocessTaskState.status === 'failed' || novelPreprocessTaskState.status === 'interrupted' ? 'text-red-400' : 'text-purple-300'}`}>
+                        {novelPreprocessTaskState.status === 'pending' ? '等待中' : novelPreprocessTaskState.status === 'running' ? '处理中' : novelPreprocessTaskState.status === 'completed' ? '已完成' : novelPreprocessTaskState.status === 'interrupted' ? '已中断' : '失败'}
+                      </span>
+                    </div>
+                    <div className="text-xs text-gray-400">
+                      阶段：{novelPreprocessTaskState.stage === 'connectivity' ? '连通性检测' : novelPreprocessTaskState.stage === 'asset_extraction' ? '资产提取' : novelPreprocessTaskState.stage === 'segmenting' ? '分段处理中' : novelPreprocessTaskState.stage === 'second_pass' ? '二次加工' : novelPreprocessTaskState.stage === 'interrupted' ? '服务重启中断' : novelPreprocessTaskState.stage === 'failed' ? '任务失败' : '处理完成'}
+                    </div>
+                    <div className="text-xs text-gray-400">
+                      进度：{novelPreprocessTaskState.progress.completed}/{novelPreprocessTaskState.progress.total}
+                      {novelPreprocessTaskState.progress.currentEpisodeName ? ` · 当前：${novelPreprocessTaskState.progress.currentEpisodeName}` : ''}
+                    </div>
+                    <div className="w-full bg-gray-700 rounded-full h-2 overflow-hidden">
+                      <div
+                        className="bg-purple-500 h-2 transition-all duration-300"
+                        style={{ width: `${novelPreprocessTaskState.progress.total > 0 ? (novelPreprocessTaskState.progress.completed / novelPreprocessTaskState.progress.total) * 100 : 0}%` }}
+                      />
+                    </div>
+                    {novelPreprocessTaskState.error && (
+                      <div className="text-xs text-red-300 whitespace-pre-wrap">{novelPreprocessTaskState.error}</div>
+                    )}
+                  </div>
+                )}
                 {(() => {
                   const typePrompts = globalSettings.projectTypePrompts[currentProject?.type ?? 'REAL_PERSON_COMMENTARY'] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
                   const hasSecondPassPrompt = !!typePrompts.preprocessSecondPassPrompt?.trim();
@@ -6894,21 +7597,47 @@ const App: React.FC = () => {
                     </label>
                   );
                 })()}
+                <label className="flex items-center gap-2 select-none cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={enableAutoStoryboard}
+                    onChange={e => setEnableAutoStoryboard(e.target.checked)}
+                    disabled={isPreprocessing || !!storyboardProgress}
+                    className="accent-purple-500 w-4 h-4"
+                  />
+                  <span className="text-sm text-gray-300">一键分镜</span>
+                  <span className="text-xs text-gray-500">（预处理完成后自动对成功分集执行分镜拆解）</span>
+                </label>
+                {storyboardProgress && (
+                  <div className="bg-gray-900 rounded-lg p-4 border border-purple-700 space-y-2">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-gray-300">分镜拆解进度</span>
+                      <span className="font-medium text-purple-300">{storyboardProgress.current}/{storyboardProgress.total}</span>
+                    </div>
+                    <div className="text-xs text-gray-400">当前：{storyboardProgress.currentName}</div>
+                    <div className="w-full bg-gray-700 rounded-full h-2 overflow-hidden">
+                      <div
+                        className="bg-purple-500 h-2 transition-all duration-300"
+                        style={{ width: `${(storyboardProgress.current / storyboardProgress.total) * 100}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
               </div>
               <div className="p-5 border-t border-gray-700 flex justify-end gap-3">
                 <button
                   onClick={() => { setShowNovelPreprocessModal(false); setPreprocessNovelText(''); }}
-                  className="px-5 py-2.5 rounded-lg text-gray-300 hover:bg-gray-700 font-medium"
-                  disabled={isPreprocessing}
+                  className="px-5 py-2.5 rounded-lg text-gray-300 hover:bg-gray-700 font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                  disabled={isPreprocessing || !!storyboardProgress}
                 >
                   取消
                 </button>
                 <button
                   onClick={handleNovelPreprocess}
-                  disabled={isPreprocessing || !preprocessNovelText.trim() || detectEpisodeTitles(preprocessNovelText).length === 0}
+                  disabled={isPreprocessing || !!storyboardProgress || !preprocessNovelText.trim() || detectEpisodeTitles(preprocessNovelText).length === 0}
                   className="px-6 py-2.5 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-white font-medium flex items-center gap-2 transition-colors"
                 >
-                  {isPreprocessing ? <><Loader2 size={16} className="animate-spin" /> 处理中...</> : '开始预处理'}
+                  {isPreprocessing ? <><Loader2 size={16} className="animate-spin" /> 处理中...</> : storyboardProgress ? <><Loader2 size={16} className="animate-spin" /> 分镜拆解中...</> : '开始预处理'}
                 </button>
               </div>
             </div>
@@ -6953,7 +7682,71 @@ const App: React.FC = () => {
             onClose={() => setShowGlobalSettingsModal(false)}
           />
         )}
-      </div>
+
+        {/* 分集回收站 Modal */}
+        {showEpisodeRecycleBinModal && (
+          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+            <div className="bg-gray-800 rounded-2xl w-full max-w-3xl overflow-hidden border border-gray-700 shadow-2xl flex flex-col max-h-[90vh]">
+              <div className="p-5 border-b border-gray-700 flex justify-between items-center shrink-0">
+                <h2 className="text-xl font-bold flex items-center gap-2">
+                  <Trash2 size={18} className="text-gray-400" /> 分集回收站
+                </h2>
+                <button
+                  onClick={() => setShowEpisodeRecycleBinModal(false)}
+                  className="text-gray-400 hover:text-white transition-colors"
+                >
+                  <X size={24} />
+                </button>
+              </div>
+              <div className="p-6 overflow-y-auto flex-1">
+                {isEpisodeRecycleBinLoading ? (
+                  <div className="text-gray-400 text-sm flex items-center gap-2">
+                    <Loader2 size={16} className="animate-spin" /> 加载中...
+                  </div>
+                ) : episodeRecycleBin.length === 0 ? (
+                  <div className="text-center py-16 text-gray-500">
+                    <div className="text-lg mb-2">回收站为空</div>
+                    <div className="text-sm opacity-70">删除的分集会出现在这里</div>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {episodeRecycleBin.map((episode) => (
+                      <div
+                        key={episode.id}
+                        className="bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 flex items-center justify-between"
+                      >
+                        <div className="min-w-0">
+                          <div className="text-white font-medium truncate">{episode.name}</div>
+                          <div className="text-xs text-gray-500 mt-1 flex items-center gap-3">
+                            <span>{episode.scriptContent?.length ?? 0} 字</span>
+                            <span>{episode.frames?.length ?? 0} 分镜</span>
+                            <span>删除时间: {new Date(episode.deletedAt).toLocaleString()}</span>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0 ml-4">
+                          <button
+                            onClick={() => handleRestoreEpisode(episode.id)}
+                            className="px-3 py-1.5 rounded bg-green-600/20 text-green-300 hover:bg-green-600/40 text-xs font-medium flex items-center gap-1 transition-colors"
+                          >
+                            <RefreshCw size={12} /> 恢复
+                          </button>
+                          <button
+                            onClick={() => handlePermanentDeleteEpisode(episode.id)}
+                            className="px-3 py-1.5 rounded bg-red-600/20 text-red-300 hover:bg-red-600/40 text-xs font-medium flex items-center gap-1 transition-colors"
+                          >
+                            <Trash2 size={12} /> 永久删除
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        </div>
+      </>
     );
   }
 
@@ -6966,14 +7759,16 @@ const App: React.FC = () => {
 
     return (
       <>
-        <Layout 
+        {taskProgressBar}
+        <Layout
           title={`${currentProject.name} / ${currentEpisode.name}`}
-          activeTab={activeTab} 
+          activeTab={activeTab}
           onTabChange={setActiveTab}
           onBack={() => {
              setCurrentEpisodeId(null);
              setViewMode(ViewMode.PROJECT_DETAIL);
           }}
+          hasTaskBar={activeTasks.length > 0}
           headerRight={
               <button
                 onClick={handleOpenGlobalSettingsModal}
@@ -7677,7 +8472,7 @@ const App: React.FC = () => {
                        )}
                        
                        {(frame.isGenerating || frame.isGeneratingVideo || frame.videoTaskStatus === 'waiting') && (
-                         <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-10 flex-col gap-2 pointer-events-none">
+                         <div className={`absolute inset-0 bg-black/70 flex items-center justify-center z-10 flex-col gap-2 ${frame.videoTaskStatus === 'waiting' ? '' : 'pointer-events-none'}`}>
                            <Loader2 className={`w-8 h-8 ${frame.videoTaskStatus === 'waiting' ? 'text-yellow-400' : 'animate-spin text-blue-500'}`} />
 
                            {/* 显示进度百分比 */}
@@ -7686,13 +8481,26 @@ const App: React.FC = () => {
                                生成中 {Math.round(frame.imageProgress)}%
                              </span>
                            ) : frame.videoTaskStatus === 'waiting' ? (
-                            <span className="text-xs text-yellow-300 font-medium">
-                              {frame.videoQueuePosition ? `队列等待中 · 前面还有 ${Math.max(frame.videoQueuePosition - 1, 0)} 个` : '队列等待中...'}
-                            </span>
+                            <div className="flex flex-col items-center gap-1">
+                              <span className="text-xs text-yellow-300 font-medium">
+                                {frame.videoQueuePosition ? `队列等待中 · 前面还有 ${Math.max(frame.videoQueuePosition - 1, 0)} 个` : '队列等待中...'}
+                              </span>
+                              <button
+                                onClick={() => handleCancelFrameVideo(frame.id)}
+                                className="text-xs text-red-400 hover:text-red-300 underline"
+                              >
+                                取消
+                              </button>
+                            </div>
                           ) : frame.isGeneratingVideo && frame.videoProgress !== undefined ? (
+                            <div className="flex flex-col items-center gap-1">
                              <span className="text-xs text-purple-300 font-medium">
                                生成视频 {Math.round(frame.videoProgress)}%
                              </span>
+                             <span className="text-[9px] text-gray-400">
+                               {frame.videoSessionName || '获取账号中...'}
+                             </span>
+                            </div>
                            ) : (
                              <span className="text-xs text-blue-300 font-medium">
                                {frame.isGeneratingVideo ? '正在生成视频...' : '正在生成图片...'}
@@ -7750,8 +8558,8 @@ const App: React.FC = () => {
                        {/* Reference Indicators */}
                        <div className="absolute bottom-2 left-2 flex gap-1 pointer-events-none">
                           {frame.videoUrl && (
-                            <div className="bg-purple-600/70 px-1.5 py-0.5 rounded text-[10px] text-white flex items-center gap-1 border border-purple-400/40" title="视频已生成">
-                               <Film size={8} /> 视频
+                            <div className="bg-purple-600/70 px-1.5 py-0.5 rounded text-[10px] text-white flex items-center gap-1 border border-purple-400/40" title={frame.videoSessionName ? `视频已生成 · 账号: ${frame.videoSessionName}` : "视频已生成"}>
+                               <Film size={8} /> 视频{frame.videoSessionName ? ` · ${frame.videoSessionName}` : ''}
                             </div>
                           )}
                           {frame.references.characterIds.length > 0 && (
@@ -8050,6 +8858,9 @@ const App: React.FC = () => {
                                         <span className={`text-[10px] font-medium ${frame.videoTaskStatus === 'waiting' ? 'text-yellow-200' : 'text-purple-200'}`}>
                                             {frame.videoTaskStatus === 'waiting' ? (frame.videoQueuePosition ? `等待中·前${Math.max(frame.videoQueuePosition - 1, 0)}个` : '队列等待中') : frame.videoProgress !== undefined ? `视频 ${Math.round(frame.videoProgress)}%` : '视频生成中'}
                                         </span>
+                                        <span className="text-[9px] text-gray-400">
+                                            {frame.videoSessionName || '获取账号中...'}
+                                        </span>
                                     </div>
                                 )}
 
@@ -8213,6 +9024,15 @@ const App: React.FC = () => {
                       <Download size={16} /> 下载视频
                     </a>
                   )}
+                  {(previewFrame.seedanceTaskId || previewFrame.videoUrl?.includes('jimeng.com') || previewFrame.videoUrl?.includes('vlabvod.com')) && (
+                    <button
+                      onClick={() => handleRefetchVideoResult(previewFrame.id)}
+                      className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors text-sm"
+                      title="重新从即梦API获取视频URL"
+                    >
+                      <RefreshCw size={16} /> 重新获取
+                    </button>
+                  )}
                   <button onClick={() => setPreviewFrameId(null)} className="text-gray-400 hover:text-white transition-colors">
                     <X size={20} />
                   </button>
@@ -8332,6 +9152,22 @@ const App: React.FC = () => {
                   <p className="text-xs text-gray-500 mt-1">共 {currentEpisode.scriptContent.length.toLocaleString()} 字</p>
                 </div>
                 <p className="text-xs text-gray-500">仅对当前分集文本执行导演分段，不提取资产。分段完成后将展示预览供你确认。</p>
+                {episodePreprocessTaskState && !episodePreprocessTaskState.resultAppliedAt && (
+                  <div className="bg-gray-900 rounded-lg p-4 border border-gray-700 space-y-2">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-gray-300">任务状态</span>
+                      <span className={`font-medium ${episodePreprocessTaskState.status === 'completed' ? 'text-green-400' : episodePreprocessTaskState.status === 'failed' || episodePreprocessTaskState.status === 'interrupted' ? 'text-red-400' : 'text-teal-300'}`}>
+                        {episodePreprocessTaskState.status === 'pending' ? '等待中' : episodePreprocessTaskState.status === 'running' ? '处理中' : episodePreprocessTaskState.status === 'completed' ? '已完成' : episodePreprocessTaskState.status === 'interrupted' ? '已中断' : '失败'}
+                      </span>
+                    </div>
+                    <div className="text-xs text-gray-400">
+                      阶段：{episodePreprocessTaskState.stage === 'connectivity' ? '连通性检测' : episodePreprocessTaskState.stage === 'segmenting' ? '分段处理中' : episodePreprocessTaskState.stage === 'second_pass' ? '二次加工' : episodePreprocessTaskState.stage === 'interrupted' ? '服务重启中断' : episodePreprocessTaskState.stage === 'failed' ? '任务失败' : '处理完成'}
+                    </div>
+                    {episodePreprocessTaskState.error && (
+                      <div className="text-xs text-red-300 whitespace-pre-wrap">{episodePreprocessTaskState.error}</div>
+                    )}
+                  </div>
+                )}
                 {(() => {
                   const typePrompts = globalSettings.projectTypePrompts[currentProject.type] ?? globalSettings.projectTypePrompts['REAL_PERSON_COMMENTARY'];
                   const hasSecondPassPrompt = !!typePrompts.preprocessSecondPassPrompt?.trim();

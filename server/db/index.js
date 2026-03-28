@@ -8,6 +8,7 @@ import { JSONFile } from 'lowdb/node';
 import fs from 'fs/promises';
 import { readFileSync } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
+import { ensureProjectStats } from '../services/projectStats.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, '../../data');
@@ -166,8 +167,8 @@ export async function initDatabase() {
       }
 
       for (const session of db.data.seedanceSessions) {
-        if (session.maxConcurrent == null || session.maxConcurrent === 2 || session.maxConcurrent === 5) {
-          session.maxConcurrent = 10;
+        if (session.maxConcurrent == null || session.maxConcurrent === 2 || session.maxConcurrent === 5 || session.maxConcurrent === 10) {
+          session.maxConcurrent = 15;
           changed = true;
         }
         if (!session.activeTasks) {
@@ -181,10 +182,16 @@ export async function initDatabase() {
 
       for (const project of db.data.projects) {
         changed = ensureProjectId(project) || changed;
+        changed = ensureProjectStats(project) || changed;
+        if (!Array.isArray(project.episodeRecycleBin)) {
+          project.episodeRecycleBin = [];
+          changed = true;
+        }
       }
 
       for (const project of db.data.recycleBin) {
         changed = ensureProjectId(project) || changed;
+        changed = ensureProjectStats(project) || changed;
       }
 
       if (changed) {

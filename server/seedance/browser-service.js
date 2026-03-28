@@ -146,7 +146,10 @@ class BrowserService {
           // 最终失败：清理上下文后抛出
           try { await context.close(); } catch { /* ignore */ }
           this.sessions.delete(sessionId);
-          throw new Error(`即梦页面导航失败（已重试${PAGE_GOTO_MAX_RETRIES}次，超时${PAGE_GOTO_TIMEOUT / 1000}秒）: ${navErr.message}`);
+          throw Object.assign(
+            new Error(`即梦页面导航失败（已重试${PAGE_GOTO_MAX_RETRIES}次，超时${PAGE_GOTO_TIMEOUT / 1000}秒）: ${navErr.message}`),
+            { isNavError: true, sessionId }
+          );
         }
         console.warn(`[browser] 导航超时 (第${attempt + 1}次): ${navErr.message}，即将重试...`);
         // 重试前刷新 page
@@ -210,20 +213,66 @@ class BrowserService {
 
     console.log(`[browser] 通过浏览器代理请求: ${method} ${url.substring(0, 80)}...`);
 
-    const result = await session.page.evaluate(
-      async ({ url, method, headers, body }) => {
-        const resp = await fetch(url, {
-          method,
-          headers,
-          body: body || undefined,
-          credentials: 'include',
-        });
-        return resp.json();
-      },
-      { url, method, headers, body }
-    );
+    try {
+      const result = await session.page.evaluate(
+        async ({ url, method, headers, body }) => {
+          try {
+            const resp = await fetch(url, {
+              method,
+              headers,
+              body: body || undefined,
+              credentials: 'include',
+            });
 
-    return result;
+            const contentType = resp.headers.get('content-type') || '';
+            if (!resp.ok) {
+              return {
+                _browserError: true,
+                status: resp.status,
+                statusText: resp.statusText,
+                isJson: contentType.includes('application/json')
+              };
+            }
+
+            if (!contentType.includes('application/json')) {
+              const text = await resp.text();
+              return {
+                _browserError: true,
+                status: resp.status,
+                message: `即梦返回非JSON响应: ${text.substring(0, 200)}`
+              };
+            }
+
+            return await resp.json();
+          } catch (err) {
+            return {
+              _browserError: true,
+              message: err.message || String(err),
+              stack: err.stack
+            };
+          }
+        },
+        { url, method, headers, body }
+      );
+
+      if (result._browserError) {
+        const errMsg = result.message || `HTTP ${result.status} ${result.statusText || ''}`;
+        throw Object.assign(
+          new Error(`浏览器请求失败 [sessionId=${sessionId.substring(0, 8)}***]: ${errMsg}`),
+          { isBrowserError: true, browserErrorDetail: result }
+        );
+      }
+
+      return result;
+    } catch (err) {
+      if (err.isBrowserError) throw err;
+
+      const errDetail = err.message || String(err);
+      throw Object.assign(
+        new Error(`浏览器执行异常 [sessionId=${sessionId.substring(0, 8)}***]: ${errDetail}`),
+        { isBrowserError: true, originalError: err }
+      );
+    }
   }
 
   async close() {

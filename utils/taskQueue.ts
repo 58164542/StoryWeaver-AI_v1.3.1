@@ -104,6 +104,20 @@ class TaskQueueManager {
   }
 
   /**
+   * 根据目标ID取消排队中（未开始执行）的任务
+   * 只能取消 status='queued' 的任务，已在执行中的任务无法取消
+   * @returns true 表示成功取消，false 表示任务不在队列中（可能已在执行）
+   */
+  cancelByTarget(targetId: string): boolean {
+    const index = this.queue.findIndex(t => t.targetId === targetId);
+    if (index === -1) return false;
+    const task = this.queue.splice(index, 1)[0];
+    this.statuses.delete(task.id);
+    this.notifyListeners();
+    return true;
+  }
+
+  /**
    * 根据目标ID获取任务状态
    */
   getStatusByTarget(targetId: string): TaskStatus | undefined {

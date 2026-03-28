@@ -1,6 +1,15 @@
 
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { AnalysisResult, StoryboardBreakdown, StoryboardBreakdownFrame, StoryboardDialogueLine } from "../types";
+
+const toGeminiUsage = (usageMetadata: any) => {
+  if (!usageMetadata) return null;
+  return {
+    promptTokenCount: usageMetadata.promptTokenCount ?? 0,
+    candidatesTokenCount: usageMetadata.candidatesTokenCount ?? 0,
+    totalTokenCount: usageMetadata.totalTokenCount ?? 0,
+  };
+};
 import { Logger } from "../utils/logger";
 import { buildPromptWithRefs } from "../utils/imagePromptUtils";
 
@@ -205,6 +214,9 @@ export const analyzeNovelScript = async (
 
     if (response.text) {
       const result = JSON.parse(extractGeminiJson(response.text)) as AnalysisResult;
+      result.usage = toGeminiUsage((response as any).usageMetadata);
+      result.provider = 'gemini';
+      result.model = model;
 
       Logger.logOperationEnd('分析小说文本（Gemini）', {
         charactersCount: result.characters.length,
@@ -383,6 +395,10 @@ export const generateStoryboardBreakdown = async (
         }
         return frame;
       });
+
+      result.usage = toGeminiUsage((response as any).usageMetadata);
+      result.provider = 'gemini';
+      result.model = model;
 
       Logger.logOperationEnd('生成分镜分解（Gemini）', {
         framesCount: result.frames.length

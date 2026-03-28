@@ -10,6 +10,7 @@ import { createReadStream } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import JSZip from 'jszip';
 import { extractFilenameFromUrl, getMediaPath } from '../utils/fileManager.js';
+import { applyProjectFrameVideoSuccess, ensureProjectStats, recordProjectTextUsage } from '../services/projectStats.js';
 
 const router = express.Router();
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -165,6 +166,11 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ success: false, error: '项目不存在' });
     }
 
+    const changed = ensureProjectStats(project);
+    if (changed) {
+      await saveDatabase();
+    }
+
     res.json({ success: true, data: project });
   } catch (error) {
     console.error('获取项目失败:', error);
@@ -194,6 +200,7 @@ router.post('/', async (req, res) => {
     // 添加时间戳
     newProject.createdAt = newProject.createdAt || Date.now();
     newProject.updatedAt = Date.now();
+    ensureProjectStats(newProject, newProject.createdAt);
 
     // 添加到数据库
     db.data.projects.push(newProject);
@@ -339,6 +346,143 @@ router.put('/:id/episodes/:episodeId', async (req, res) => {
     res.json({ success: true, data: project });
   } catch (error) {
     console.error('更新分集失败:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/projects/:id/episodes/:eid
+ * 软删除分集 → 移入 episodeRecycleBin
+ */
+router.delete('/:id/episodes/:eid', async (req, res) => {
+  try {
+    const db = getDatabase();
+    const projectIndex = db.data.projects.findIndex(p => p.id === req.params.id);
+
+    if (projectIndex === -1) {
+      return res.status(404).json({ success: false, error: '项目不存在' });
+    }
+
+    const project = db.data.projects[projectIndex];
+    const episodes = project.episodes || [];
+    const episodeIndex = episodes.findIndex(e => e.id === req.params.eid);
+
+    if (episodeIndex === -1) {
+      return res.status(404).json({ success: false, error: '分集不存在' });
+    }
+
+    const [deleted] = episodes.splice(episodeIndex, 1);
+    const deletedEntry = { ...deleted, deletedAt: Date.now() };
+
+    if (!Array.isArray(project.episodeRecycleBin)) {
+      project.episodeRecycleBin = [];
+    }
+    project.episodeRecycleBin.push(deletedEntry);
+    project.updatedAt = Date.now();
+
+    await saveDatabase();
+
+    console.log(`✅ 分集已移入回收站: ${project.name} / ${deleted.name}`);
+    res.json({ success: true, data: { episodeId: deleted.id } });
+  } catch (error) {
+    console.error('软删除分集失败:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/projects/:id/episode-recycle-bin
+ * 获取项目的分集回收站列表
+ */
+router.get('/:id/episode-recycle-bin', async (req, res) => {
+  try {
+    const db = getDatabase();
+    const project = db.data.projects.find(p => p.id === req.params.id);
+
+    if (!project) {
+      return res.status(404).json({ success: false, error: '项目不存在' });
+    }
+
+    res.json({ success: true, data: project.episodeRecycleBin || [] });
+  } catch (error) {
+    console.error('获取分集回收站失败:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/projects/:id/episode-recycle-bin/:eid/restore
+ * 恢复分集（从 episodeRecycleBin 移回 episodes 末尾）
+ */
+router.post('/:id/episode-recycle-bin/:eid/restore', async (req, res) => {
+  try {
+    const db = getDatabase();
+    const projectIndex = db.data.projects.findIndex(p => p.id === req.params.id);
+
+    if (projectIndex === -1) {
+      return res.status(404).json({ success: false, error: '项目不存在' });
+    }
+
+    const project = db.data.projects[projectIndex];
+    const bin = project.episodeRecycleBin || [];
+    const entryIndex = bin.findIndex(e => e.id === req.params.eid);
+
+    if (entryIndex === -1) {
+      return res.status(404).json({ success: false, error: '回收站中不存在该分集' });
+    }
+
+    const [entry] = bin.splice(entryIndex, 1);
+    const { deletedAt, ...restored } = entry;
+    restored.updatedAt = Date.now();
+
+    if (!Array.isArray(project.episodes)) {
+      project.episodes = [];
+    }
+    project.episodes.push(restored);
+    project.episodeRecycleBin = bin;
+    project.updatedAt = Date.now();
+
+    await saveDatabase();
+
+    console.log(`✅ 分集已恢复: ${project.name} / ${restored.name}`);
+    res.json({ success: true, data: restored });
+  } catch (error) {
+    console.error('恢复分集失败:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/projects/:id/episode-recycle-bin/:eid
+ * 永久删除回收站中的分集
+ */
+router.delete('/:id/episode-recycle-bin/:eid', async (req, res) => {
+  try {
+    const db = getDatabase();
+    const projectIndex = db.data.projects.findIndex(p => p.id === req.params.id);
+
+    if (projectIndex === -1) {
+      return res.status(404).json({ success: false, error: '项目不存在' });
+    }
+
+    const project = db.data.projects[projectIndex];
+    const bin = project.episodeRecycleBin || [];
+    const entryIndex = bin.findIndex(e => e.id === req.params.eid);
+
+    if (entryIndex === -1) {
+      return res.status(404).json({ success: false, error: '回收站中不存在该分集' });
+    }
+
+    const [removed] = bin.splice(entryIndex, 1);
+    project.episodeRecycleBin = bin;
+    project.updatedAt = Date.now();
+
+    await saveDatabase();
+
+    console.log(`✅ 分集已永久删除: ${removed.name}`);
+    res.json({ success: true, message: '分集已永久删除' });
+  } catch (error) {
+    console.error('永久删除分集失败:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -759,6 +903,90 @@ router.patch('/:id/frames/:frameId', async (req, res) => {
     res.json({ success: true, data: { projectId, episodeId, frameId, updatedAt: project.updatedAt } });
   } catch (error) {
     console.error('更新分镜文本失败:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.patch('/:id/frames/:frameId/video', async (req, res) => {
+  try {
+    const { id: projectId, frameId } = req.params;
+    const { episodeId, videoUrl, videoDuration } = req.body || {};
+
+    if (!episodeId || !videoUrl) {
+      return res.status(400).json({ success: false, error: '缺少 episodeId 或 videoUrl 字段' });
+    }
+
+    const db = getDatabase();
+    const project = db.data.projects.find(p => p.id === projectId);
+
+    if (!project) {
+      return res.status(404).json({ success: false, error: '项目不存在' });
+    }
+
+    const result = applyProjectFrameVideoSuccess(project, {
+      episodeId,
+      frameId,
+      videoUrl,
+      videoDuration,
+      now: Date.now(),
+    });
+    project.updatedAt = Date.now();
+
+    await saveDatabase();
+
+    console.log(`✅ 分镜视频已原子更新: project=${projectId}, frame=${frameId}, counted=${result.recorded}`);
+    res.json({
+      success: true,
+      data: {
+        projectId,
+        episodeId,
+        frameId,
+        recorded: result.recorded,
+        updatedAt: project.updatedAt,
+        stats: project.stats,
+      },
+    });
+  } catch (error) {
+    console.error('更新分镜视频失败:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.post('/:id/stats/text-usage', async (req, res) => {
+  try {
+    const project = getDatabase().data.projects.find(p => p.id === req.params.id);
+
+    if (!project) {
+      return res.status(404).json({ success: false, error: '项目不存在' });
+    }
+
+    const { provider, model, taskType, idempotencyKey, usage } = req.body || {};
+    if (!provider || !model || !taskType || !idempotencyKey || !usage) {
+      return res.status(400).json({ success: false, error: '缺少 provider、model、taskType、idempotencyKey 或 usage 字段' });
+    }
+
+    const recorded = recordProjectTextUsage(project, {
+      provider,
+      model,
+      taskType,
+      idempotencyKey,
+      usage,
+      now: Date.now(),
+    });
+    if (recorded) {
+      project.updatedAt = Date.now();
+      await saveDatabase();
+    }
+
+    res.json({
+      success: true,
+      data: {
+        recorded,
+        stats: project.stats,
+      },
+    });
+  } catch (error) {
+    console.error('记录项目文本统计失败:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });

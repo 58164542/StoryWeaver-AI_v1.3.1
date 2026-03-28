@@ -29,6 +29,7 @@ export interface ProjectTypeInstruction {
 
 export interface GlobalSettings {
   extractionModel: string;
+  preprocessModel?: string; // 预处理模型（资产提取、角色提取、场景提取）
   multiRefVideoModel?: string; // 多参考生视频模型
   projectTypePrompts: Record<string, ProjectTypeInstruction>;
   projectTypeLabels?: Record<string, string>; // 项目类型的自定义显示名称
@@ -42,7 +43,7 @@ export interface GlobalSettings {
 export interface SeedanceSession {
   id: string;
   name: string;
-  status: 'active' | 'expired' | 'insufficient' | 'disabled' | 'security_check';
+  status: 'active' | 'expired' | 'member_expired' | 'insufficient' | 'disabled' | 'security_check';
   credits: number | null;
   lastUsed: number;
   currentTasks: number;
@@ -135,6 +136,7 @@ export interface StoryboardFrame {
   imageProgress?: number;  // 0-100
   videoProgress?: number;  // 0-100
   audioProgress?: number;  // 0-100
+  videoSessionName?: string; // 视频生成使用的 session 账号名
   videoTaskStatus?: 'waiting' | 'loading'; // 视频任务状态：排队中/生成中
   videoQueuePosition?: number; // 视频任务在队列中的位置（从 1 开始，不含当前运行中的任务）
   seedanceTaskId?: string; // Seedance 微服务任务 ID，用于刷新/重启后恢复轮询
@@ -154,6 +156,44 @@ export interface Episode {
   preprocessSegmentFailed?: boolean; // 小说预处理分段失败，当前 scriptContent 为回退原文
 }
 
+// 被软删除的分集条目（项目级别的分集回收站）
+export interface DeletedEpisode extends Episode {
+  deletedAt: number;
+}
+
+export interface TokenUsageBucket {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  requestCount: number;
+}
+
+export interface ProviderModelUsage {
+  totals: TokenUsageBucket;
+  taskTypes: Record<string, TokenUsageBucket>;
+}
+
+export interface ProviderUsageSummary {
+  totals: TokenUsageBucket;
+  models: Record<string, ProviderModelUsage>;
+}
+
+export interface ProjectStats {
+  textUsage: {
+    totals: TokenUsageBucket;
+    providers: Record<string, ProviderUsageSummary>;
+  };
+  videoGeneration: {
+    seedanceSuccessCount: number;
+  };
+  implementationProgress: {
+    phase: string;
+    coverage: string[];
+    statsActivatedAt: number;
+    lastUpdatedAt: number;
+  };
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -166,6 +206,8 @@ export interface Project {
   variants: CharacterVariant[];  // 角色变体资产（如服装变体）
   scenes: Scene[];
   episodes: Episode[];
+  episodeRecycleBin?: DeletedEpisode[];  // 分集回收站
+  stats?: ProjectStats;
 }
 
 export interface AnalysisResult {
@@ -177,6 +219,9 @@ export interface AnalysisResult {
     context?: string;
     appearance: string;
   }>;
+  usage?: any;
+  provider?: string;
+  model?: string;
 }
 
 export interface StoryboardDialogueLine {
@@ -203,4 +248,7 @@ export interface StoryboardBreakdownFrame {
 
 export interface StoryboardBreakdown {
   frames: StoryboardBreakdownFrame[];
+  usage?: any;
+  provider?: string;
+  model?: string;
 }

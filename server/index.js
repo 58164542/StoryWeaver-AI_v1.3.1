@@ -13,6 +13,8 @@ import jianyingRouter from './routes/jianying.js';
 import klingRouter from './routes/kling.js';
 import seedanceSessionsRouter from './routes/seedance-sessions.js';
 import claudeRouter from './routes/claude.js';
+import preprocessTasksRouter from './routes/preprocess-tasks.js';
+import { initPreprocessTaskManager } from './services/preprocessTaskManager.js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { readFile } from 'fs/promises';
@@ -42,6 +44,7 @@ app.use('/api/jianying', jianyingRouter);
 app.use('/api/kling', klingRouter);
 app.use('/api/seedance-sessions', seedanceSessionsRouter);
 app.use('/api/claude', claudeRouter);
+app.use('/api/preprocess', preprocessTasksRouter);
 
 app.get('/api/system-prompts/segment-skill', async (req, res) => {
   try {
@@ -213,6 +216,7 @@ async function startServer() {
 
     // 初始化数据库
     await initDatabase();
+    await initPreprocessTaskManager();
 
     // 监听所有网络接口（允许局域网访问）
     app.listen(PORT, '0.0.0.0', () => {

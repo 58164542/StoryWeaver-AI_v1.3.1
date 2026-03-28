@@ -1,8 +1,9 @@
 /**
  * Claude 服务 - 通过本地后端代理调用 claude-sonnet-4-6（避免 CORS 问题）
  * 支持的上游端点（由后端 server/routes/claude.js 代理）：
- * - Univibe: https://api.univibe.cc/anthropic/v1/messages
- * - 柏拉图中转: https://api.bltcy.ai/v1/messages
+ * - 柏拉图中转: https://api.bltcy.ai/v1/messages        (Authorization: Bearer)
+ * - CC580:      https://cc.580ai.net/v1/messages         (x-api-key)
+ * - Univibe:    https://api.univibe.cc/anthropic/v1/messages (x-api-key, 稳定性较差排最后)
  *
  * 注意：API Key 存放在后端 process.env，前端不持有任何密钥
  */
@@ -10,10 +11,11 @@
 import { AnalysisResult, StoryboardBreakdown, StoryboardDialogueLine } from '../types';
 import { Logger } from '../utils/logger';
 
-export type ClaudeProviderType = 'univibe' | 'bltcy';
+export type ClaudeProviderType = 'univibe' | 'bltcy' | 'cc580';
+export type ClaudeModelType = 'claude-sonnet-4-6' | 'claude-opus-4-6' | 'claude-opus-4-6-thinking';
 
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
-const CLAUDE_THINKING_BUDGET_TOKENS = 4096;
+const CLAUDE_THINKING_BUDGET_TOKENS = 8000;
 
 /** 本地后端代理地址（与 apiService.ts 中的 API_BASE_URL 逻辑一致） */
 function getProxyUrl(): string {
@@ -26,7 +28,7 @@ function getProxyUrl(): string {
 }
 
 // 全局状态：当前使用的 Claude 提供商
-let currentClaudeProvider: ClaudeProviderType = 'univibe';
+let currentClaudeProvider: ClaudeProviderType = 'bltcy';
 
 export function setClaudeProvider(provider: ClaudeProviderType) {
   console.log(`🔄 切换 Claude 提供商: ${currentClaudeProvider} → ${provider}`);
@@ -50,9 +52,10 @@ export async function checkClaudeConnectivity(
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-  const providerName = provider === 'univibe' ? 'Univibe' : '柏拉图中转';
+  const providerName = provider === 'univibe' ? 'Univibe' : provider === 'cc580' ? 'CC580' : '柏拉图中转';
 
   try {
+    console.log(`[claude][${providerName}] 连通性检测开始`);
     const response = await fetch(getProxyUrl(), {
       method: 'POST',
       headers: buildProxyHeaders(),
@@ -67,18 +70,26 @@ export async function checkClaudeConnectivity(
 
     // 任何 HTTP 响应（包括 4xx）都说明网络连通，只有 5xx 才视为不可用
     if (response.status < 500) {
+      if (response.status !== 200) {
+        console.warn(`[claude][${providerName}] 连通性检测返回 ${response.status}，接口可达但响应异常，已加入可用列表`);
+      } else {
+        console.log(`[claude][${providerName}] 连通性检测通过 (${response.status})`);
+      }
       return { ok: true };
     }
 
     const errorText = await response.text().catch(() => '');
+    console.warn(`[claude][${providerName}] 连通性检测失败 (${response.status})`);
     return {
       ok: false,
       error: `${providerName} Claude 服务不可用（${response.status}）: ${errorText.slice(0, 200) || response.statusText}`,
     };
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
+      console.warn(`[claude][${providerName}] 连通性检测超时`);
       return { ok: false, error: `${providerName} Claude 连通性检测超时（>${timeoutMs}ms）` };
     }
+    console.warn(`[claude][${providerName}] 连通性检测异常:`, error);
     return { ok: false, error: `${providerName} Claude 连通性检测失败: ${error instanceof Error ? error.message : String(error)}` };
   } finally {
     clearTimeout(timeoutId);
@@ -184,6 +195,7 @@ function parseAnthropicSseChunk(
     throw new Error(message);
   }
 
+  // 只提取 text 类型的内容，跳过 thinking
   const text = eventData?.type === 'content_block_delta' && eventData?.delta?.type === 'text_delta'
     ? eventData.delta.text || ''
     : eventData?.type === 'content_block_start' && eventData?.content_block?.type === 'text'
@@ -215,6 +227,9 @@ interface ChapterPreprocessPromptContext {
 export interface SegmentEpisodeResult {
   content: string;
   failed: boolean;
+  usage?: any;
+  provider?: ClaudeProviderType;
+  model?: string;
 }
 
 function renderChapterPreprocessPrompt(template: string, context: ChapterPreprocessPromptContext): string {
@@ -247,9 +262,11 @@ export async function segmentEpisodeWithClaude(
   skillContent: string,
   debugLabel = '未命名分集',
   promptContext?: Omit<ChapterPreprocessPromptContext, 'chapterText'>,
-  provider?: ClaudeProviderType
+  provider?: ClaudeProviderType,
+  model?: ClaudeModelType
 ): Promise<SegmentEpisodeResult> {
   const providerType = provider || currentClaudeProvider;
+  const modelType = model || CLAUDE_MODEL;
 
   const renderedPrompt = renderChapterPreprocessPrompt(skillContent, {
     chapterText: episodeText,
@@ -258,10 +275,11 @@ export async function segmentEpisodeWithClaude(
 
   const payload = {
     provider: providerType,
-    model: CLAUDE_MODEL,
-    temperature: 0,
-    max_tokens: 30000,
+    model: modelType,
+    temperature: 1,
+    max_tokens: 40000,
     stream: true,
+    ...(modelType.includes('thinking') ? { thinking: buildThinkingConfig() } : {}),
     system: renderedPrompt,
     messages: [
       {
@@ -275,7 +293,7 @@ export async function segmentEpisodeWithClaude(
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      console.group(`%c[分段][${debugLabel}][第${attempt}次] 请求体`, 'color: #60a5fa; font-weight: bold');
+      console.group(`%c[分段][${providerType}][${modelType}][${debugLabel}][第${attempt}次] 请求体`, 'color: #60a5fa; font-weight: bold');
       console.log(sanitizeAnthropicLogValue(JSON.parse(JSON.stringify(payload))));
       console.groupEnd();
 
@@ -285,13 +303,13 @@ export async function segmentEpisodeWithClaude(
         body: JSON.stringify(payload),
       });
 
-      console.group(`%c[分段][${debugLabel}][第${attempt}次] 响应头`, 'color: #34d399; font-weight: bold');
+      console.group(`%c[分段][${providerType}][${debugLabel}][第${attempt}次] 响应头`, 'color: #34d399; font-weight: bold');
       console.log('status:', response.status);
       console.groupEnd();
 
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`分段 API 请求失败 (${response.status}): ${errorText.slice(0, 300)}`);
+        throw new Error(`[${providerType}] 分段 API 请求失败 (${response.status}): ${errorText.slice(0, 300)}`);
       }
 
       // 防止 URL 配置错误时 200 HTML 响应被当成 SSE 处理
@@ -353,12 +371,15 @@ export async function segmentEpisodeWithClaude(
       if (stopReason === 'max_tokens') {
         // 截断原因是上下文/输出超限，换相同 payload 重试必然复现，直接标记失败
         console.error(`[分段][${debugLabel}] 输出被截断（max_tokens），不重试，回退为原始章节文本`);
-        return { content: episodeText, failed: true };
+        return { content: episodeText, failed: true, usage, provider: providerType, model: modelType };
       }
 
       return {
         content: String(content).trim(),
         failed: false,
+        usage,
+        provider: providerType,
+        model: modelType,
       };
     } catch (error) {
       console.warn(`[分段][${debugLabel}] 第 ${attempt} 次失败:`, error);
@@ -367,12 +388,15 @@ export async function segmentEpisodeWithClaude(
         return {
           content: episodeText,
           failed: true,
+          usage: undefined,
+          provider: providerType,
+          model: modelType,
         };
       }
     }
   }
 
-  return { content: episodeText, failed: true };
+  return { content: episodeText, failed: true, usage: undefined, provider: providerType, model: modelType };
 }
 
 /**
@@ -382,14 +406,18 @@ export async function segmentEpisodeWithClaude(
 export async function analyzeNovelScriptWithClaude(
   scriptContent: string,
   systemInstruction: string,
-  provider?: ClaudeProviderType
+  provider?: ClaudeProviderType,
+  model?: ClaudeModelType
 ): Promise<AnalysisResult> {
   const providerType = provider || currentClaudeProvider;
+  const modelType = model || CLAUDE_MODEL;
 
   const payload = {
     provider: providerType,
-    model: CLAUDE_MODEL,
-    max_tokens: 30000,
+    model: modelType,
+    temperature: 1,
+    max_tokens: 40000,
+    ...(modelType.includes('thinking') ? { thinking: buildThinkingConfig() } : {}),
     system: '你是一个结构化信息提取助手。无论用户提供什么文本，你只能输出纯JSON对象，不得包含任何markdown标记、代码块、解释文字、标题或换行注释。你的输出必须能被 JSON.parse() 直接解析。',
     messages: [
       {
@@ -412,7 +440,7 @@ ${scriptContent}`,
     ],
   };
 
-  console.group('%c[Claude] 请求体', 'color: #a78bfa; font-weight: bold');
+  console.group(`%c[Claude][${providerType}][${modelType}] 资产提取请求体`, 'color: #a78bfa; font-weight: bold');
   console.log(sanitizeAnthropicLogValue(JSON.parse(JSON.stringify(payload))));
   console.groupEnd();
 
@@ -424,13 +452,13 @@ ${scriptContent}`,
 
   const rawText = await response.text();
 
-  console.group('%c[Claude] 响应体', 'color: #34d399; font-weight: bold');
+  console.group(`%c[Claude][${providerType}][${modelType}] 资产提取响应体`, 'color: #34d399; font-weight: bold');
   console.log('status:', response.status);
   console.log('raw text:', sanitizeAnthropicRawTextForLog(rawText));
   console.groupEnd();
 
   if (!response.ok) {
-    throw new Error(`Claude API 请求失败 (${response.status}): ${rawText}`);
+    throw new Error(`[${providerType}] Claude API 请求失败 (${response.status}): ${rawText}`);
   }
 
   assertNotHtmlResponse(response.headers.get('content-type'), rawText, '[Claude 资产提取]');
@@ -453,6 +481,8 @@ ${scriptContent}`,
   console.groupEnd();
 
   let jsonStr = content.trim();
+  // 去除 thinking 标签（bltcy 可能返回 <thinking>...</thinking> 包裹的内容）
+  jsonStr = jsonStr.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '');
   // 去除 markdown 代码块包裹
   const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenceMatch) jsonStr = fenceMatch[1].trim();
@@ -479,10 +509,13 @@ ${scriptContent}`,
     }
   }
 
-  const result: AnalysisResult = {
+  const result: AnalysisResult & { usage?: any; provider?: ClaudeProviderType; model?: string } = {
     characters: Array.isArray(parsed.characters) ? parsed.characters : [],
     scenes: Array.isArray(parsed.scenes) ? parsed.scenes : [],
     variants: Array.isArray(parsed.variants) ? parsed.variants : [],
+    usage: data?.usage,
+    provider: providerType,
+    model: modelType,
   };
 
   Logger.logInfo('Claude 资产提取完成', {
@@ -501,14 +534,18 @@ ${scriptContent}`,
 export async function generateStoryboardBreakdownWithClaude(
   scriptContent: string,
   systemInstruction: string,
-  provider?: ClaudeProviderType
+  provider?: ClaudeProviderType,
+  model?: ClaudeModelType
 ): Promise<StoryboardBreakdown> {
   const providerType = provider || currentClaudeProvider;
+  const modelType = model || CLAUDE_MODEL;
 
   const payload = {
     provider: providerType,
-    model: CLAUDE_MODEL,
-    max_tokens: 30000,
+    model: modelType,
+    temperature: 1,
+    max_tokens: 40000,
+    ...(modelType.includes('thinking') ? { thinking: buildThinkingConfig() } : {}),
     system: '你是一个分镜拆解助手。无论用户提供什么文本，你只能输出纯JSON对象，不得包含任何markdown标记、代码块、解释文字、标题或换行注释。你的输出必须能被 JSON.parse() 直接解析。',
     messages: [
       {
@@ -578,7 +615,7 @@ ${scriptContent.substring(0, 30000)}`,
 
   const frames = Array.isArray(parsed.frames) ? parsed.frames : Array.isArray(parsed) ? parsed : [];
 
-  const result: StoryboardBreakdown = {
+  const result: StoryboardBreakdown & { usage?: any; provider?: ClaudeProviderType; model?: string } = {
     frames: frames.map((f: any) => {
       const imagePrompt = typeof f.imagePrompt === 'string' ? f.imagePrompt : (f.prompt ?? '');
       const videoPrompt = typeof f.videoPrompt === 'string' ? f.videoPrompt : (f.prompt ?? '');
@@ -611,6 +648,9 @@ ${scriptContent.substring(0, 30000)}`,
         sceneName: f.sceneName,
       };
     }),
+    usage: data?.usage,
+    provider: providerType,
+    model: modelType,
   };
 
   Logger.logInfo('Claude 分镜拆解完成', {
