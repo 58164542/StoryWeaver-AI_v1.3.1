@@ -2,8 +2,8 @@ import { chromium } from 'playwright-core';
 
 const SESSION_IDLE_TIMEOUT = 10 * 60 * 1000; // 10 minutes
 const BDMS_READY_TIMEOUT = 30000; // 30 seconds
-const PAGE_GOTO_TIMEOUT = 60000; // 60 seconds (即梦首页在弱网下加载较慢)
-const PAGE_GOTO_MAX_RETRIES = 2; // 导航失败最多重试次数
+const PAGE_GOTO_TIMEOUT = 120000; // 120 seconds (增加到2分钟)
+const PAGE_GOTO_MAX_RETRIES = 3; // 导航失败最多重试次数（增加到3次）
 
 const BLOCKED_RESOURCE_TYPES = ['image', 'font', 'stylesheet', 'media'];
 // 方法1: 扩展白名单，覆盖字节跳动全系安全指纹 SDK 域名

@@ -494,6 +494,7 @@ export async function updateFrameVideo(
   payload: {
     videoUrl: string;
     videoDuration?: number;
+    successTaskKey?: string;
   }
 ) {
   return request(`/api/projects/${projectId}/frames/${frameId}/video`, {

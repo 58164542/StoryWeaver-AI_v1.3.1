@@ -128,7 +128,8 @@ router.post('/reset-insufficient', async (req, res) => {
 // POST /api/seedance-sessions/acquire — 原子获取一个可用 session（全局 Round-Robin）
 router.post('/acquire', async (req, res) => {
   try {
-    const { taskId } = req.body;
+    const { taskId, excludeSessionIds = [] } = req.body;
+    const excluded = new Set(Array.isArray(excludeSessionIds) ? excludeSessionIds : []);
     const db = getDatabase();
     const sessions = db.data.seedanceSessions || [];
     const now = Date.now();
@@ -139,7 +140,7 @@ router.post('/acquire', async (req, res) => {
     }
 
     const available = sessions
-      .filter(s => s.status === 'active' && (s.currentTasks || 0) < (s.maxConcurrent || 15))
+      .filter(s => !excluded.has(s.id) && s.status === 'active' && (s.currentTasks || 0) < (s.maxConcurrent || 15))
       .sort((a, b) => (a.lastUsed || 0) - (b.lastUsed || 0));
 
     if (available.length === 0) {

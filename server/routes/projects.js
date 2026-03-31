@@ -910,7 +910,7 @@ router.patch('/:id/frames/:frameId', async (req, res) => {
 router.patch('/:id/frames/:frameId/video', async (req, res) => {
   try {
     const { id: projectId, frameId } = req.params;
-    const { episodeId, videoUrl, videoDuration } = req.body || {};
+    const { episodeId, videoUrl, videoDuration, successTaskKey } = req.body || {};
 
     if (!episodeId || !videoUrl) {
       return res.status(400).json({ success: false, error: '缺少 episodeId 或 videoUrl 字段' });
@@ -928,6 +928,7 @@ router.patch('/:id/frames/:frameId/video', async (req, res) => {
       frameId,
       videoUrl,
       videoDuration,
+      successTaskKey,
       now: Date.now(),
     });
     project.updatedAt = Date.now();

@@ -50,12 +50,12 @@ class SessionManager {
    * @param {string} [taskId] 微服务侧的任务ID，用于精准追踪并发占用
    * @returns {Promise<object|null>} 包含完整 sessionId 的 session 对象
    */
-  async acquireSession(taskId) {
+  async acquireSession(taskId, excludeSessionIds = []) {
     try {
       const response = await fetch(`${getMainBackendUrl()}/api/seedance-sessions/acquire`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ taskId }),
+        body: JSON.stringify({ taskId, excludeSessionIds }),
       });
 
       if (response.status === 503) {

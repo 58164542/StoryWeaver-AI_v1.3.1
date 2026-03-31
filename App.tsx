@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import {
   Project, Episode, ViewMode, ProjectTab, Character, Scene, StoryboardFrame, ProjectType, ProjectSettings, GlobalSettings, ProjectTypeInstruction, StoryboardDialogueLine, CharacterVariant, SeedanceSession, AnalysisResult
@@ -2518,9 +2518,10 @@ const App: React.FC = () => {
     episodeId: string,
     frameId: string,
     videoUrl: string,
-    videoDuration?: number
+    videoDuration?: number,
+    successTaskKey?: string
   ) => {
-    const response = await apiService.updateFrameVideo(projectId, episodeId, frameId, { videoUrl, videoDuration });
+    const response = await apiService.updateFrameVideo(projectId, episodeId, frameId, { videoUrl, videoDuration, successTaskKey });
     const nextStats = response?.data?.stats;
 
     setProjects(prev => prev.map(p => {
@@ -2561,12 +2562,30 @@ const App: React.FC = () => {
     if (seedancePollingFramesRef.current.has(frameId)) return;
     seedancePollingFramesRef.current.add(frameId);
 
+    // 从 state 中实时获取项目/分集/分镜信息
+    const getLogInfo = () => {
+      const project = projects.find(p => p.id === projectId);
+      const episode = project?.episodes.find(e => e.id === episodeId);
+      const frame = episode?.frames.find(f => f.id === frameId);
+      return {
+        projectName: project?.name || '未知',
+        episodeName: episode?.name || '未知',
+        frameIndex: frame ? frame.index + 1 : '?',
+        sessionName: frame?.videoSessionName || ''
+      };
+    };
+
+    const logInfo = getLogInfo();
+    const logPrefix = `[Seedance轮询] 项目: ${logInfo.projectName} | 分集: ${logInfo.episodeName} | 分镜 #${logInfo.frameIndex}`;
+
+    console.log(`${logPrefix} | 开始轮询任务: ${taskId}${logInfo.sessionName ? ` | 账号: ${logInfo.sessionName}` : ''}`);
+
     persistFrameVideoState(projectId, episodeId, frameId, frame => ({
       ...frame,
       isGeneratingVideo: true,
-      videoTaskStatus: 'loading',
+      videoTaskStatus: 'waiting',
       videoQueuePosition: undefined,
-      videoProgress: frame.videoProgress ?? 0,
+      videoProgress: 0,
       videoError: undefined,
       seedanceTaskId: taskId,
       seedanceTaskUpdatedAt: Date.now(),
@@ -2574,6 +2593,15 @@ const App: React.FC = () => {
 
     try {
       let videoUrl = await pollJimengSeedanceTask(taskId, (progress, sessionName) => {
+        const logInfo = getLogInfo();
+        const logPrefix = `[Seedance轮询] 项目: ${logInfo.projectName} | 分集: ${logInfo.episodeName} | 分镜 #${logInfo.frameIndex}`;
+
+        // 首次获取到账号名称时输出
+        if (sessionName && progress <= 5) {
+          console.log(`${logPrefix} | 已分配账号: ${sessionName}`);
+        }
+
+        console.log(`${logPrefix} | 进度: ${progress}% | 账号: ${sessionName || '获取中'}`);
         setProjects(prev => prev.map(p => p.id !== projectId ? p : {
           ...p,
           episodes: p.episodes.map(e => e.id !== episodeId ? e : {
@@ -2595,19 +2623,21 @@ const App: React.FC = () => {
         videoUrl = savedVideo.url;
       }
       videoUrl = apiService.toAbsoluteApiUrl(videoUrl);
-      console.log(`[视频生成完成] frameId=${frameId}, videoUrl=${videoUrl}`);
+      const finalLogInfo = getLogInfo();
+      console.log(`[视频生成完成] 项目: ${finalLogInfo.projectName} | 分集: ${finalLogInfo.episodeName} | 分镜 #${finalLogInfo.frameIndex} | videoUrl=${videoUrl}`);
 
-      await commitFrameVideoSuccess(projectId, episodeId, frameId, videoUrl, videoDuration);
+      await commitFrameVideoSuccess(projectId, episodeId, frameId, videoUrl, videoDuration, `jimeng:${taskId}`);
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      Logger.logError('App', '生成视频失败', { taskId, frameId, error: errorMessage });
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
+      Logger.logError('App', `生成视频失败 [taskId=${taskId}] [frameId=${frameId}]`, normalizedError);
+      const errorMessage = normalizedError.message;
       persistFrameVideoState(projectId, episodeId, frameId, frame => ({
         ...frame,
         isGeneratingVideo: false,
         videoTaskStatus: undefined,
         videoQueuePosition: undefined,
         videoProgress: undefined,
-        videoError: errorMessage,
+        videoError: mapVideoErrorMessage(errorMessage),
         seedanceTaskId: undefined,
         seedanceTaskUpdatedAt: Date.now(),
       }));
@@ -2615,7 +2645,7 @@ const App: React.FC = () => {
     } finally {
       seedancePollingFramesRef.current.delete(frameId);
     }
-  }, [persistFrameVideoState]);
+  }, [persistFrameVideoState, projects]);
 
   const enqueueFrameVideoGeneration = useCallback((project: Project, episode: Episode, frameId: string) => {
     const projectId = project.id;
@@ -2630,6 +2660,8 @@ const App: React.FC = () => {
     const frame = episode.frames.find(f => f.id === frameId);
     if (!frame) return;
     if (!multiRefMode && !frame.imageUrl) return;
+
+    console.log(`[视频生成] 项目: ${project.name} | 分集: ${episode.name} | 分镜 #${frame.index + 1} | 模型: ${model}`);
 
     let multiRefImages: string[] = [];
     let multiRefMapping = '';
@@ -2819,9 +2851,10 @@ const App: React.FC = () => {
           videoUrl = savedVideo.url;
         }
         videoUrl = apiService.toAbsoluteApiUrl(videoUrl);
-        console.log(`[视频生成完成] frameId=${frameId}, videoUrl=${videoUrl}`);
+        console.log(`[视频生成完成] 项目: ${project.name} | 分集: ${episode.name} | 分镜 #${frame.index + 1} | videoUrl=${videoUrl}`);
 
-        await commitFrameVideoSuccess(projectId, episodeId, frameId, videoUrl, videoDuration);
+        const seedanceSuccessTaskKey = model.startsWith('seedance-2') ? `seedance:${projectId}:${episodeId}:${frameId}:${videoUrl}` : undefined;
+        await commitFrameVideoSuccess(projectId, episodeId, frameId, videoUrl, videoDuration, seedanceSuccessTaskKey);
       },
       onError: (error: string) => {
         Logger.logError('App', '生成视频失败', error);
@@ -2831,7 +2864,7 @@ const App: React.FC = () => {
           videoTaskStatus: undefined,
           videoQueuePosition: undefined,
           videoProgress: undefined,
-          videoError: error,
+          videoError: mapVideoErrorMessage(error),
           seedanceTaskId: undefined,
           seedanceTaskUpdatedAt: Date.now(),
         }));
@@ -3050,6 +3083,48 @@ const App: React.FC = () => {
     }
   }, []);
   const failedPreprocessEpisodes = getFailedPreprocessEpisodes(currentProject?.episodes ?? []);
+  const activeFrameTasks = useMemo(() => {
+    const grouped = new Map<string, ActiveTask>();
+    for (const task of activeTasks) {
+      const frameKey = `${task.projectId}:${task.episodeId}:${task.frameId}`;
+      const existing = grouped.get(frameKey);
+      if (!existing) {
+        grouped.set(frameKey, task);
+        continue;
+      }
+      const score = (item: ActiveTask) => item.status === 'processing' ? 2 : 1;
+      if (score(task) > score(existing) || (score(task) === score(existing) && task.startTime > existing.startTime)) {
+        grouped.set(frameKey, task);
+      }
+    }
+    return grouped;
+  }, [activeTasks]);
+
+  const getFrameActiveTask = useCallback((projectId: string, episodeId: string, frameId: string) => {
+    return activeFrameTasks.get(`${projectId}:${episodeId}:${frameId}`);
+  }, [activeFrameTasks]);
+
+  const getDerivedFrameVideoTaskStatus = useCallback((projectId: string | undefined, episodeId: string | undefined, frame: StoryboardFrame | undefined) => {
+    const backendTask = projectId && episodeId && frame ? getFrameActiveTask(projectId, episodeId, frame.id) : undefined;
+    const videoTaskStatus = backendTask?.status === 'processing' ? 'loading' : backendTask?.status === 'waiting' ? 'waiting' : frame?.videoTaskStatus;
+    return { backendTask, videoTaskStatus };
+  }, [getFrameActiveTask]);
+
+  const mapVideoErrorMessage = useCallback((message: string) => {
+    if (!message) return message;
+    let normalized = message;
+    if (normalized.includes('2038') || normalized.includes('内容被过滤')) {
+      normalized = normalized.replace(/内容被过滤，请修改提示词后重试|视频生成失败，错误码:\s*2038/g, '输入的文字不符合平台规则');
+    }
+    if (normalized.includes('2039') || normalized.includes('图片不符合平台规则')) {
+      normalized = normalized.replace(/视频生成失败，错误码:\s*2039|图片不符合平台规则/g, '输入的图片不符合平台规则');
+    }
+    if (normalized.includes('2043') || normalized.includes('未通过审核')) {
+      normalized = normalized.replace(/视频生成失败，错误码:\s*2043|结果未通过审核|未通过审核/g, '视频生成结果未通过审核');
+    }
+    return normalized;
+  }, []);
+
   const hasAnyAssetImages = Boolean(
     currentProject && (
       (currentProject.characters || []).some(character => !!character.imageUrl) ||
@@ -3059,6 +3134,36 @@ const App: React.FC = () => {
   );
   const editingFrame = currentEpisode?.frames.find(f => f.id === editingFrameId);
   const previewFrame = currentEpisode?.frames.find(f => f.id === previewFrameId);
+  const deriveFrameVideoState = useCallback((projectId: string | undefined, episodeId: string | undefined, frame: StoryboardFrame | undefined) => {
+    if (!projectId || !episodeId || !frame) {
+      return {
+        backendTask: undefined,
+        videoTaskStatus: frame?.videoTaskStatus,
+        videoQueuePosition: frame?.videoQueuePosition,
+        isGeneratingVideo: frame?.isGeneratingVideo,
+        videoSessionName: frame?.videoSessionName,
+      };
+    }
+
+    const backendTask = getFrameActiveTask(projectId, episodeId, frame.id);
+    if (backendTask) {
+      return {
+        backendTask,
+        videoTaskStatus: backendTask.status === 'processing' ? 'loading' : 'waiting',
+        videoQueuePosition: backendTask.status === 'waiting' ? undefined : undefined,
+        isGeneratingVideo: true,
+        videoSessionName: backendTask.sessionName || frame.videoSessionName,
+      };
+    }
+
+    return {
+      backendTask: undefined,
+      videoTaskStatus: frame.videoTaskStatus,
+      videoQueuePosition: frame.videoQueuePosition,
+      isGeneratingVideo: frame.isGeneratingVideo,
+      videoSessionName: frame.videoSessionName,
+    };
+  }, [getFrameActiveTask]);
   const previewAssetItem = previewAsset
     ? previewAsset.type === 'character'
       ? currentProject?.characters.find(c => c.id === previewAsset.id)
@@ -3284,27 +3389,38 @@ const App: React.FC = () => {
 
     seedanceRecoveryStartedRef.current = true;
 
+    const activeTaskByFrameKey = new Map(Array.from(activeFrameTasks.entries()));
+
     projects.forEach(project => {
       project.episodes.forEach(episode => {
         episode.frames.forEach(frame => {
-          if (frame.videoTaskStatus === 'waiting' && !frame.seedanceTaskId) {
-            enqueueFrameVideoGeneration(project, episode, frame.id);
-            return;
-          }
+          const frameKey = `${project.id}:${episode.id}:${frame.id}`;
+          const backendTask = activeTaskByFrameKey.get(frameKey);
 
-          if (frame.videoTaskStatus === 'loading' && frame.seedanceTaskId) {
+          if (backendTask) {
             void startSeedanceTaskPolling(
               project.id,
               episode.id,
               frame.id,
-              frame.seedanceTaskId,
+              backendTask.id,
               frame.videoDuration ?? project.settings.videoDuration ?? 5
             ).catch(() => {});
+            return;
+          }
+
+          if (frame.videoTaskStatus === 'waiting' || frame.videoTaskStatus === 'loading' || frame.isGeneratingVideo) {
+            persistFrameVideoState(project.id, episode.id, frame.id, currentFrame => ({
+              ...currentFrame,
+              isGeneratingVideo: false,
+              videoTaskStatus: undefined,
+              videoQueuePosition: undefined,
+              videoProgress: undefined,
+            }));
           }
         });
       });
     });
-  }, [enqueueFrameVideoGeneration, isGlobalSettingsInitialized, projects, startSeedanceTaskPolling]);
+  }, [activeFrameTasks, isGlobalSettingsInitialized, projects, startSeedanceTaskPolling, persistFrameVideoState]);
 
   useEffect(() => {
     // 自动保存资产到后端（只在资产修改后保存）
@@ -6611,17 +6727,42 @@ const App: React.FC = () => {
     enqueueFrameVideoGeneration(currentProject, currentEpisode, frameId);
   };
 
-  const handleCancelFrameVideo = (frameId: string) => {
+  const handleCancelFrameVideo = async (frameId: string) => {
     if (!currentProject || !currentEpisode) return;
+
+    const frame = currentEpisode.frames.find(f => f.id === frameId);
+    if (!frame) return;
+
+    console.log(`[取消视频] 项目: ${currentProject.name} | 分集: ${currentEpisode.name} | 分镜 #${frame.index + 1}`);
+
     const cancelled = taskQueue.cancelByTarget(frameId);
-    if (cancelled) {
-      persistFrameVideoState(currentProject.id, currentEpisode.id, frameId, frame => ({
-        ...frame,
-        videoTaskStatus: undefined,
-        videoQueuePosition: undefined,
-        videoProgress: undefined,
-      }));
+
+    persistFrameVideoState(currentProject.id, currentEpisode.id, frameId, f => ({
+      ...f,
+      isGeneratingVideo: false,
+      videoTaskStatus: undefined,
+      videoQueuePosition: undefined,
+      videoProgress: undefined,
+      videoError: undefined,
+    }));
+
+    try {
+      const response = await fetch(`${apiService.SEEDANCE_API_URL}/api/tasks/by-frame`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectId: currentProject.id,
+          episodeId: currentEpisode.id,
+          frameId,
+        }),
+      });
+      const data = await response.json().catch(() => ({}));
+      console.log(`[取消视频] 后端按分镜取消完成: cancelled=${data.cancelledCount ?? 0}`);
+    } catch (err) {
+      console.warn(`[取消视频] 后端按分镜取消失败:`, err);
     }
+
+    console.log(`[取消视频] 队列取消=${cancelled}`);
   };
 
   const handleRefetchVideoResult = async (frameId: string) => {
@@ -6634,12 +6775,12 @@ const App: React.FC = () => {
 
       if (frame.seedanceTaskId) {
         // 有任务ID：重新轮询获取最新URL
-        persistFrameVideoState(currentProject.id, currentEpisode.id, frameId, f => ({
-          ...f,
+        persistFrameVideoState(currentProject.id, currentEpisode.id, frameId, frame => ({
+          ...frame,
           isGeneratingVideo: true,
           videoTaskStatus: 'loading',
           videoQueuePosition: undefined,
-          videoProgress: f.videoProgress ?? 0,
+          videoProgress: frame.videoProgress ?? 0,
           videoError: undefined,
           seedanceTaskUpdatedAt: Date.now(),
         }));
@@ -6662,7 +6803,7 @@ const App: React.FC = () => {
         }
         videoUrl = apiService.toAbsoluteApiUrl(videoUrl);
 
-        await commitFrameVideoSuccess(currentProject.id, currentEpisode.id, frameId, videoUrl, frame.videoDuration);
+        await commitFrameVideoSuccess(currentProject.id, currentEpisode.id, frameId, videoUrl, frame.videoDuration, frame.seedanceTaskId ? `jimeng:${frame.seedanceTaskId}` : undefined);
       } else if (frame.videoUrl && (frame.videoUrl.includes('jimeng.com') || frame.videoUrl.includes('vlabvod.com'))) {
         // 无任务ID但有即梦URL：通过后端代理保存
         const savedVideo = await apiService.saveExternalVideo(frame.videoUrl, `${currentProject.id}_${currentEpisode.id}_${frameId}_video`);
@@ -6868,16 +7009,16 @@ const App: React.FC = () => {
   // --- Views ---
 
   // Task Progress Bar (shown across all views)
-  const taskProgressBar = activeTasks.length > 0 && (
+  const taskProgressBar = activeFrameTasks.size > 0 && (
     <div className="fixed top-0 left-0 right-0 bg-blue-900/95 backdrop-blur-sm border-b border-blue-700 z-50 px-4 py-2">
       <div className="flex items-center gap-4 overflow-x-auto">
-        <span className="text-sm font-medium text-blue-200 whitespace-nowrap">正在生成 ({activeTasks.length}):</span>
-        {activeTasks.map(task => {
+        <span className="text-sm font-medium text-blue-200 whitespace-nowrap">正在生成 ({activeFrameTasks.size}):</span>
+        {Array.from(activeFrameTasks.values()).map(task => {
           const project = projects.find(p => p.id === task.projectId);
           const episode = project?.episodes.find(e => e.id === task.episodeId);
           const frameIndex = episode?.frames.findIndex(f => f.id === task.frameId);
           return (
-            <div key={task.id} className="flex items-center gap-2 bg-blue-800/50 px-3 py-1 rounded text-xs whitespace-nowrap">
+            <div key={`${task.projectId}:${task.episodeId}:${task.frameId}`} className="flex items-center gap-2 bg-blue-800/50 px-3 py-1 rounded text-xs whitespace-nowrap">
               <Loader2 size={12} className="animate-spin text-blue-300" />
               <span className="text-blue-100">
                 {project?.name || '未知项目'} / {episode?.name || '未知分集'} / 分镜#{(frameIndex ?? -1) + 1}
@@ -6894,7 +7035,7 @@ const App: React.FC = () => {
     return (
       <>
         {taskProgressBar}
-        <div className={`min-h-screen bg-gray-900 text-white p-8 relative ${activeTasks.length > 0 ? 'pt-20' : ''}`}>
+        <div className={`min-h-screen bg-gray-900 text-white p-8 relative ${activeFrameTasks.size > 0 ? 'pt-20' : ''}`}>
         <div className="max-w-6xl mx-auto">
           <header className="flex justify-between items-center mb-12">
             <div>
@@ -7258,7 +7399,7 @@ const App: React.FC = () => {
         {taskProgressBar}
         <div className="h-screen h-[100dvh] bg-gray-900 text-white flex flex-col overflow-hidden">
         {/* Header */}
-        <header className={`h-16 bg-gray-950 border-b border-gray-800 flex items-center justify-between px-6 shrink-0 ${activeTasks.length > 0 ? 'mt-14' : ''}`}>
+        <header className={`h-16 bg-gray-950 border-b border-gray-800 flex items-center justify-between px-6 shrink-0 ${activeFrameTasks.size > 0 ? 'mt-14' : ''}`}>
            <div className="flex items-center gap-4">
               <button 
                 onClick={() => { setSelectedEpisodeIds(new Set()); setViewMode(ViewMode.PROJECT_LIST); }}
@@ -7553,7 +7694,7 @@ const App: React.FC = () => {
                     </div>
                   );
                 })()}
-                <p className="text-xs text-gray-500">资产提取将使用文本前 8000 字；分集将追加到现有列表。</p>
+                <p className="text-xs text-gray-500">资产提取将使用文本前 30000 字；分集将追加到现有列表。</p>
                 {novelPreprocessTaskState && !novelPreprocessTaskState.resultAppliedAt && (
                   <div className="bg-gray-900 rounded-lg p-4 border border-gray-700 space-y-2">
                     <div className="flex items-center justify-between text-sm">
@@ -7768,7 +7909,7 @@ const App: React.FC = () => {
              setCurrentEpisodeId(null);
              setViewMode(ViewMode.PROJECT_DETAIL);
           }}
-          hasTaskBar={activeTasks.length > 0}
+          hasTaskBar={activeFrameTasks.size > 0}
           headerRight={
               <button
                 onClick={handleOpenGlobalSettingsModal}
@@ -8471,50 +8612,53 @@ const App: React.FC = () => {
                          </div>
                        )}
                        
-                       {(frame.isGenerating || frame.isGeneratingVideo || frame.videoTaskStatus === 'waiting') && (
-                         <div className={`absolute inset-0 bg-black/70 flex items-center justify-center z-10 flex-col gap-2 ${frame.videoTaskStatus === 'waiting' ? '' : 'pointer-events-none'}`}>
-                           <Loader2 className={`w-8 h-8 ${frame.videoTaskStatus === 'waiting' ? 'text-yellow-400' : 'animate-spin text-blue-500'}`} />
+                       {(() => {
+                         const derived = deriveFrameVideoState(currentProject?.id, currentEpisode?.id, frame);
+                         return (frame.isGenerating || derived.isGeneratingVideo || derived.videoTaskStatus === 'waiting') && (
+                           <div className={`absolute inset-0 bg-black/70 flex items-center justify-center z-10 flex-col gap-2 ${derived.videoTaskStatus === 'waiting' ? '' : 'pointer-events-none'}`}>
+                             <Loader2 className={`w-8 h-8 ${derived.videoTaskStatus === 'waiting' ? 'text-yellow-400' : 'animate-spin text-blue-500'}`} />
 
-                           {/* 显示进度百分比 */}
-                           {frame.isGenerating && frame.imageProgress !== undefined ? (
-                             <span className="text-xs text-blue-300 font-medium">
-                               生成中 {Math.round(frame.imageProgress)}%
-                             </span>
-                           ) : frame.videoTaskStatus === 'waiting' ? (
-                            <div className="flex flex-col items-center gap-1">
-                              <span className="text-xs text-yellow-300 font-medium">
-                                {frame.videoQueuePosition ? `队列等待中 · 前面还有 ${Math.max(frame.videoQueuePosition - 1, 0)} 个` : '队列等待中...'}
-                              </span>
-                              <button
-                                onClick={() => handleCancelFrameVideo(frame.id)}
-                                className="text-xs text-red-400 hover:text-red-300 underline"
-                              >
-                                取消
-                              </button>
-                            </div>
-                          ) : frame.isGeneratingVideo && frame.videoProgress !== undefined ? (
-                            <div className="flex flex-col items-center gap-1">
+                             {/* 显示进度百分比 */}
+                             {frame.isGenerating && frame.imageProgress !== undefined ? (
+                               <span className="text-xs text-blue-300 font-medium">
+                                 生成中 {Math.round(frame.imageProgress)}%
+                               </span>
+                             ) : derived.videoTaskStatus === 'waiting' ? (
+                              <div className="flex flex-col items-center gap-1">
+                                <span className="text-xs text-yellow-300 font-medium">
+                                  {derived.backendTask?.progress || (derived.videoQueuePosition ? `队列等待中 · 前面还有 ${Math.max(derived.videoQueuePosition - 1, 0)} 个` : '队列等待中...')}
+                                </span>
+                                <button
+                                  onClick={() => handleCancelFrameVideo(frame.id)}
+                                  className="text-xs text-red-400 hover:text-red-300 underline"
+                                >
+                                  取消
+                                </button>
+                              </div>
+                            ) : derived.isGeneratingVideo && frame.videoProgress !== undefined ? (
+                              <div className="flex flex-col items-center gap-1">
                              <span className="text-xs text-purple-300 font-medium">
                                生成视频 {Math.round(frame.videoProgress)}%
                              </span>
                              <span className="text-[9px] text-gray-400">
-                               {frame.videoSessionName || '获取账号中...'}
+                               {derived.videoSessionName || '获取账号中...'}
                              </span>
                             </div>
                            ) : (
                              <span className="text-xs text-blue-300 font-medium">
-                               {frame.isGeneratingVideo ? '正在生成视频...' : '正在生成图片...'}
+                               {derived.isGeneratingVideo ? '正在生成视频...' : '正在生成图片...'}
                              </span>
                            )}
                          </div>
-                       )}
+                       );
+                     })()}
 
                        {/* 错误显示 - 在卡片右上角 */}
                        {(frame.imageError || frame.videoError) && (
                          <div className="absolute top-2 right-2 group/error z-20">
                            <AlertCircle className="w-5 h-5 text-red-500 drop-shadow-lg" />
                            <div className="absolute right-0 top-6 w-56 bg-red-900/95 border border-red-700 rounded-lg p-2 text-xs text-red-100 opacity-0 group-hover/error:opacity-100 transition-opacity pointer-events-none shadow-lg whitespace-pre-wrap break-words">
-                             {frame.videoError || frame.imageError}
+                             {frame.videoError ? mapVideoErrorMessage(frame.videoError) : frame.imageError}
                            </div>
                          </div>
                        )}
@@ -8528,26 +8672,33 @@ const App: React.FC = () => {
                           >
                              <Wand2 size={20} />
                           </button>
-                          {frame.imageUrl && (
-                              <button
-                                onClick={() => handleGenerateFrameVideo(frame.id)}
-                                disabled={frame.isGeneratingVideo || frame.videoTaskStatus === 'waiting'}
-                                className="bg-purple-600 hover:bg-purple-500 disabled:bg-purple-900/60 disabled:text-purple-300/60 text-white p-2 rounded-full shadow-lg flex items-center justify-center"
-                                title={frame.videoTaskStatus === 'waiting' ? '视频队列等待中' : '生成视频'}
-                              >
-                                <Film size={20} />
-                              </button>
-                          )}
-                          {!frame.imageUrl && currentProject.settings.multiRefVideoMode && (
-                              <button
-                                onClick={() => handleGenerateFrameVideo(frame.id)}
-                                disabled={frame.isGeneratingVideo || frame.videoTaskStatus === 'waiting'}
-                                className="bg-purple-600 hover:bg-purple-500 disabled:bg-purple-900/60 disabled:text-purple-300/60 text-white p-2 rounded-full shadow-lg flex items-center justify-center"
-                                title={frame.videoTaskStatus === 'waiting' ? '视频队列等待中' : '多参考生成视频'}
-                              >
-                                <Film size={20} />
-                              </button>
-                          )}
+                          {(() => {
+                            const derived = deriveFrameVideoState(currentProject?.id, currentEpisode?.id, frame);
+                            return (
+                              <>
+                                {frame.imageUrl && (
+                                  <button
+                                    onClick={() => handleGenerateFrameVideo(frame.id)}
+                                    disabled={derived.isGeneratingVideo || derived.videoTaskStatus === 'waiting'}
+                                    className="bg-purple-600 hover:bg-purple-500 disabled:bg-purple-900/60 disabled:text-purple-300/60 text-white p-2 rounded-full shadow-lg flex items-center justify-center"
+                                    title={derived.videoTaskStatus === 'waiting' ? '视频队列等待中' : '生成视频'}
+                                  >
+                                    <Film size={20} />
+                                  </button>
+                                )}
+                                {!frame.imageUrl && currentProject.settings.multiRefVideoMode && (
+                                  <button
+                                    onClick={() => handleGenerateFrameVideo(frame.id)}
+                                    disabled={derived.isGeneratingVideo || derived.videoTaskStatus === 'waiting'}
+                                    className="bg-purple-600 hover:bg-purple-500 disabled:bg-purple-900/60 disabled:text-purple-300/60 text-white p-2 rounded-full shadow-lg flex items-center justify-center"
+                                    title={derived.videoTaskStatus === 'waiting' ? '视频队列等待中' : '多参考生成视频'}
+                                  >
+                                    <Film size={20} />
+                                  </button>
+                                )}
+                              </>
+                            );
+                          })()}
                        </div>
                        
                        {/* Frame Number */}
@@ -8744,16 +8895,20 @@ const App: React.FC = () => {
                         })()}
                         
                          {/* Loading Overlay */}
-                         {(currentEpisode.frames[currentPlaybackIndex]?.isGeneratingVideo || currentEpisode.frames[currentPlaybackIndex]?.videoTaskStatus === 'waiting') && (
+                         {(() => {
+                           const playbackFrame = currentEpisode.frames[currentPlaybackIndex];
+                           const derivedPlayback = deriveFrameVideoState(currentProject?.id, currentEpisode?.id, playbackFrame);
+                           return (derivedPlayback.isGeneratingVideo || derivedPlayback.videoTaskStatus === 'waiting') && (
                             <div className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center z-20">
-                                <Loader2 className={`w-10 h-10 mb-2 ${currentEpisode.frames[currentPlaybackIndex]?.videoTaskStatus === 'waiting' ? 'text-yellow-400' : 'animate-spin text-purple-500'}`}/>
-                                <span className="text-white font-medium">{currentEpisode.frames[currentPlaybackIndex]?.videoTaskStatus === 'waiting' ? (currentEpisode.frames[currentPlaybackIndex]?.videoQueuePosition ? `队列等待中 · 前面还有 ${Math.max((currentEpisode.frames[currentPlaybackIndex]?.videoQueuePosition ?? 1) - 1, 0)} 个` : '队列等待中...') : '正在生成视频...'}</span>
+                                <Loader2 className={`w-10 h-10 mb-2 ${derivedPlayback.videoTaskStatus === 'waiting' ? 'text-yellow-400' : 'animate-spin text-purple-500'}`}/>
+                                <span className="text-white font-medium">{derivedPlayback.videoTaskStatus === 'waiting' ? (derivedPlayback.backendTask?.progress || '队列等待中...') : '正在生成视频...'}</span>
                             </div>
-                         )}
+                           );
+                         })()}
 
                          {currentEpisode.frames[currentPlaybackIndex]?.videoError && (
                             <div className="absolute top-16 left-4 right-4 bg-red-900/85 border border-red-700 rounded-lg px-3 py-2 text-red-100 text-xs z-20 whitespace-pre-wrap break-words">
-                              {currentEpisode.frames[currentPlaybackIndex]?.videoError}
+                              {mapVideoErrorMessage(currentEpisode.frames[currentPlaybackIndex]?.videoError || '')}
                             </div>
                          )}
 
@@ -8772,17 +8927,21 @@ const App: React.FC = () => {
                          </div>
                          
                          {/* Generate Video Action (If Image Exists but No Video) */}
-                         {currentEpisode.frames[currentPlaybackIndex]?.imageUrl && !currentEpisode.frames[currentPlaybackIndex]?.videoUrl && !currentEpisode.frames[currentPlaybackIndex]?.isGeneratingVideo && (
+                         {(() => {
+                           const playbackFrame = currentEpisode.frames[currentPlaybackIndex];
+                           const derivedPlayback = deriveFrameVideoState(currentProject?.id, currentEpisode?.id, playbackFrame);
+                           return playbackFrame?.imageUrl && !playbackFrame?.videoUrl && !derivedPlayback.isGeneratingVideo && (
                             <div className="absolute bottom-20 right-8 z-10">
                                 <button
-                                    onClick={() => handleGenerateFrameVideo(currentEpisode.frames[currentPlaybackIndex].id)}
-                                    disabled={currentEpisode.frames[currentPlaybackIndex]?.videoTaskStatus === 'waiting'}
+                                    onClick={() => handleGenerateFrameVideo(playbackFrame.id)}
+                                    disabled={derivedPlayback.videoTaskStatus === 'waiting'}
                                     className="bg-purple-600 hover:bg-purple-500 disabled:bg-purple-900/60 disabled:text-purple-300/60 text-white px-4 py-2 rounded-full shadow-xl flex items-center gap-2 font-medium transition-all hover:scale-105"
                                 >
-                                    <Film size={18} /> {currentEpisode.frames[currentPlaybackIndex]?.videoTaskStatus === 'waiting' ? '视频排队中' : '生成视频'}
+                                    <Film size={18} /> {derivedPlayback.videoTaskStatus === 'waiting' ? '视频排队中' : '生成视频'}
                                 </button>
                             </div>
-                         )}
+                           );
+                         })()}
                      </div>
 
                      {/* Controls Bar */}
@@ -8852,17 +9011,20 @@ const App: React.FC = () => {
                                     </div>
                                 )}
 
-                                {(frame.isGeneratingVideo || frame.videoTaskStatus === 'waiting') && (
-                                    <div className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-1 z-10">
-                                        <Loader2 size={18} className={frame.videoTaskStatus === 'waiting' ? 'text-yellow-300' : 'animate-spin text-purple-300'} />
-                                        <span className={`text-[10px] font-medium ${frame.videoTaskStatus === 'waiting' ? 'text-yellow-200' : 'text-purple-200'}`}>
-                                            {frame.videoTaskStatus === 'waiting' ? (frame.videoQueuePosition ? `等待中·前${Math.max(frame.videoQueuePosition - 1, 0)}个` : '队列等待中') : frame.videoProgress !== undefined ? `视频 ${Math.round(frame.videoProgress)}%` : '视频生成中'}
-                                        </span>
-                                        <span className="text-[9px] text-gray-400">
-                                            {frame.videoSessionName || '获取账号中...'}
-                                        </span>
-                                    </div>
-                                )}
+                                {(() => {
+                                    const derived = deriveFrameVideoState(currentProject?.id, currentEpisode?.id, frame);
+                                    return (derived.isGeneratingVideo || derived.videoTaskStatus === 'waiting') && (
+                                        <div className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-1 z-10">
+                                            <Loader2 size={18} className={derived.videoTaskStatus === 'waiting' ? 'text-yellow-300' : 'animate-spin text-purple-300'} />
+                                            <span className={`text-[10px] font-medium ${derived.videoTaskStatus === 'waiting' ? 'text-yellow-200' : 'text-purple-200'}`}>
+                                                {derived.videoTaskStatus === 'waiting' ? (derived.backendTask?.progress || '队列等待中') : frame.videoProgress !== undefined ? `视频 ${Math.round(frame.videoProgress)}%` : '视频生成中'}
+                                            </span>
+                                            <span className="text-[9px] text-gray-400">
+                                                {derived.videoSessionName || '获取账号中...'}
+                                            </span>
+                                        </div>
+                                    );
+                                })()}
 
                                 <div className="absolute bottom-1 right-1 bg-black/60 text-white text-[10px] px-1.5 py-0.5 rounded backdrop-blur-sm">
                                     #{index + 1}

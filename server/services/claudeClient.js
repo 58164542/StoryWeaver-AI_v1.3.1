@@ -1,6 +1,6 @@
 const ANTHROPIC_VERSION = '2023-06-01';
 const CLAUDE_MODEL = 'claude-sonnet-4-6';
-const CLAUDE_THINKING_BUDGET_TOKENS = 8000;
+const CLAUDE_THINKING_BUDGET_TOKENS = 25000;
 const CLAUDE_CONNECTIVITY_TIMEOUT_MS = 15000;
 
 export const PROVIDER_UPSTREAM = {
@@ -213,7 +213,7 @@ export async function analyzeNovelScriptWithClaudeServer(scriptContent, systemIn
   const payload = {
     model: CLAUDE_MODEL,
     temperature: 1,
-    max_tokens: 40000,
+    max_tokens: 50000,
     thinking: buildThinkingConfig(),
     system: '你是一个结构化信息提取助手。无论用户提供什么文本，你只能输出纯JSON对象，不得包含任何markdown标记、代码块、解释文字、标题或换行注释。你的输出必须能被 JSON.parse() 直接解析。',
     messages: [
@@ -295,7 +295,7 @@ export async function segmentEpisodeWithClaudeServer(episodeText, skillContent, 
   const payload = {
     model: CLAUDE_MODEL,
     temperature: 1,
-    max_tokens: 40000,
+    max_tokens: 50000,
     stream: true,
     system: renderedPrompt,
     messages: [

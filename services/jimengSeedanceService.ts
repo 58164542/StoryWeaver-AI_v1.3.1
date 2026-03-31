@@ -56,7 +56,7 @@ export const pollJimengSeedanceTask = async (
   onProgress?: (progress: number, sessionName?: string) => void
 ): Promise<string> => {
   const maxAttempts = 6000;
-  const pollInterval = 3000;
+  const pollInterval = 600000; // 10分钟（与后端保持一致）
   let consecutiveFetchErrors = 0;
   const maxConsecutiveFetchErrors = 5;
 
@@ -297,6 +297,7 @@ export interface ActiveTask {
   sessionName: string;
   progress: string;
   elapsed: number;
+  startTime: number;
 }
 
 export const getActiveTasks = async (): Promise<ActiveTask[]> => {

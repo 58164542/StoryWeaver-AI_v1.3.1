@@ -76,6 +76,17 @@ if not exist "server\seedance\node_modules\" (
 :: Start development servers
 echo [STARTING] Starting services...
 echo.
+
+:: Kill any process using port 3005
+echo [INFO] Checking port 3005...
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr :3005 ^| findstr LISTENING') do (
+    if not "%%a"=="0" (
+        echo [INFO] Killing process %%a on port 3005...
+        taskkill /PID %%a /F >nul 2>&1
+    )
+)
+timeout /t 2 /nobreak >nul
+
 echo [Local Access] http://localhost:3000
 if defined ip (
     echo [Network Access] http://%ip%:3000
@@ -90,6 +101,6 @@ echo ----------------------------------------
 echo.
 
 :: Start both services in one window
-npx concurrently -n "Main,Seedance" -c "cyan,yellow" "npm start" "cd server/seedance && node index.js"
+npx concurrently -n "Main,Vite,Seedance" -c "cyan,green,yellow" "npm run server" "npm run dev" "npm run seedance"
 
 pause

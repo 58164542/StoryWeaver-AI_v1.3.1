@@ -105,36 +105,33 @@ test('recordProjectTextUsage normalizes Gemini usage and upgrades coverage to ph
   assert.deepEqual(project.stats.implementationProgress.coverage, ['claude', 'seedance', 'gemini']);
 });
 
-test('recordProjectSeedanceVideoSuccess only counts first successful frame save', () => {
+test('recordProjectSeedanceVideoSuccess counts successful Seedance tasks by unique successTaskKey', () => {
   const project = { id: 'project-1', stats: createDefaultProjectStats(1000) };
 
   const firstRecorded = recordProjectSeedanceVideoSuccess(project, {
-    episodeId: 'episode-1',
-    frameId: 'frame-1',
+    successTaskKey: 'jimeng:task-1',
     now: 2000,
   });
   const secondRecorded = recordProjectSeedanceVideoSuccess(project, {
-    episodeId: 'episode-1',
-    frameId: 'frame-1',
+    successTaskKey: 'jimeng:task-1',
     now: 3000,
   });
-  const anotherFrameRecorded = recordProjectSeedanceVideoSuccess(project, {
-    episodeId: 'episode-1',
-    frameId: 'frame-2',
+  const anotherTaskRecorded = recordProjectSeedanceVideoSuccess(project, {
+    successTaskKey: 'seedance:task-2',
     now: 4000,
   });
 
   assert.equal(firstRecorded, true);
   assert.equal(secondRecorded, false);
-  assert.equal(anotherFrameRecorded, true);
+  assert.equal(anotherTaskRecorded, true);
   assert.equal(project.stats.videoGeneration.seedanceSuccessCount, 2);
-  assert.deepEqual(project.stats.dedupe.seedanceSuccessFrameKeys, [
-    'episode-1:frame-1',
-    'episode-1:frame-2',
+  assert.deepEqual(project.stats.dedupe.seedanceSuccessTaskKeys, [
+    'jimeng:task-1',
+    'seedance:task-2',
   ]);
 });
 
-test('applyProjectFrameVideoSuccess updates frame videoUrl and counts only first empty-to-filled transition', () => {
+test('applyProjectFrameVideoSuccess updates frame videoUrl and counts every unique successful Seedance task', () => {
   const project = {
     id: 'project-1',
     stats: createDefaultProjectStats(1000),
@@ -154,23 +151,25 @@ test('applyProjectFrameVideoSuccess updates frame videoUrl and counts only first
     episodeId: 'episode-1',
     frameId: 'frame-1',
     videoUrl: '/api/media/videos/a.mp4',
+    successTaskKey: 'jimeng:task-1',
     now: 2000,
   });
   const secondApplied = applyProjectFrameVideoSuccess(project, {
     episodeId: 'episode-1',
     frameId: 'frame-1',
     videoUrl: '/api/media/videos/b.mp4',
+    successTaskKey: 'jimeng:task-2',
     now: 3000,
   });
 
   assert.equal(firstApplied.recorded, true);
-  assert.equal(secondApplied.recorded, false);
+  assert.equal(secondApplied.recorded, true);
   assert.equal(project.episodes[0].frames[0].videoUrl, '/api/media/videos/b.mp4');
   assert.equal(project.episodes[0].frames[0].isGeneratingVideo, false);
   assert.equal(project.episodes[0].frames[0].videoProgress, undefined);
   assert.equal(project.episodes[0].frames[0].videoError, undefined);
   assert.equal(project.episodes[0].frames[0].seedanceTaskUpdatedAt, 3000);
-  assert.equal(project.stats.videoGeneration.seedanceSuccessCount, 1);
+  assert.equal(project.stats.videoGeneration.seedanceSuccessCount, 2);
 });
 
 test('ensureProjectStats repairs legacy partial stats structure', () => {
@@ -198,5 +197,5 @@ test('ensureProjectStats repairs legacy partial stats structure', () => {
   assert.deepEqual(project.stats.implementationProgress.coverage, ['claude', 'seedance']);
   assert.equal(project.stats.implementationProgress.statsActivatedAt, 5555);
   assert.deepEqual(project.stats.dedupe.textUsageKeys, []);
-  assert.deepEqual(project.stats.dedupe.seedanceSuccessFrameKeys, []);
+  assert.deepEqual(project.stats.dedupe.seedanceSuccessTaskKeys, []);
 });

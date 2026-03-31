@@ -1,7 +1,7 @@
 const STATS_COVERAGE = ['claude', 'seedance'];
 const PHASE2_TEXT_PROVIDERS = ['gemini', 'volcengine'];
 const MAX_TEXT_USAGE_KEYS = 500;
-const MAX_SEEDANCE_FRAME_KEYS = 5000;
+const MAX_SEEDANCE_SUCCESS_TASK_KEYS = 5000;
 
 function createTokenBucket() {
   return {
@@ -70,7 +70,7 @@ export function createDefaultProjectStats(now = Date.now()) {
     },
     dedupe: {
       textUsageKeys: [],
-      seedanceSuccessFrameKeys: [],
+      seedanceSuccessTaskKeys: [],
     },
   };
 }
@@ -141,7 +141,7 @@ export function ensureProjectStats(project, now = Date.now()) {
   if (!project.stats.dedupe || typeof project.stats.dedupe !== 'object') {
     project.stats.dedupe = {
       textUsageKeys: [],
-      seedanceSuccessFrameKeys: [],
+      seedanceSuccessTaskKeys: [],
     };
     changed = true;
   }
@@ -151,8 +151,8 @@ export function ensureProjectStats(project, now = Date.now()) {
     changed = true;
   }
 
-  if (!Array.isArray(project.stats.dedupe.seedanceSuccessFrameKeys)) {
-    project.stats.dedupe.seedanceSuccessFrameKeys = [];
+  if (!Array.isArray(project.stats.dedupe.seedanceSuccessTaskKeys)) {
+    project.stats.dedupe.seedanceSuccessTaskKeys = [];
     changed = true;
   }
 
@@ -206,16 +206,16 @@ export function recordProjectTextUsage(project, payload) {
 export function recordProjectSeedanceVideoSuccess(project, payload) {
   ensureProjectStats(project, payload.now);
 
-  const frameKey = `${payload.episodeId}:${payload.frameId}`;
-  if (!payload.episodeId || !payload.frameId) return false;
+  const successTaskKey = payload.successTaskKey;
+  if (!successTaskKey) return false;
 
-  const dedupeKeys = project.stats.dedupe.seedanceSuccessFrameKeys;
-  if (dedupeKeys.includes(frameKey)) {
+  const dedupeKeys = project.stats.dedupe.seedanceSuccessTaskKeys;
+  if (dedupeKeys.includes(successTaskKey)) {
     return false;
   }
 
-  dedupeKeys.push(frameKey);
-  trimDedupeKeys(dedupeKeys, MAX_SEEDANCE_FRAME_KEYS);
+  dedupeKeys.push(successTaskKey);
+  trimDedupeKeys(dedupeKeys, MAX_SEEDANCE_SUCCESS_TASK_KEYS);
   project.stats.videoGeneration.seedanceSuccessCount += 1;
   project.stats.implementationProgress.lastUpdatedAt = payload.now || Date.now();
   return true;
@@ -249,7 +249,7 @@ export function applyProjectFrameVideoSuccess(project, payload) {
   }
 
   let recorded = false;
-  if (!hadVideo && payload.videoUrl) {
+  if (payload.successTaskKey) {
     recorded = recordProjectSeedanceVideoSuccess(project, payload);
   }
 

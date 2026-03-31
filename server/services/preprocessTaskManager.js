@@ -245,7 +245,7 @@ class PreprocessTaskManager {
         task.results.availableProviders = availableProviders;
       });
 
-      const textForAssets = payload.novelText.slice(0, 8000);
+      const textForAssets = payload.novelText.slice(0, 30000);
       this.updateTask(taskId, { stage: 'asset_extraction' });
 
       const analysis = await this.runAnalyzeWithFallback(textForAssets, payload.systemInstruction, availableProviders);
